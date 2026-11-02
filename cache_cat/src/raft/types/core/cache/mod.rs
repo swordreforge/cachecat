@@ -3,6 +3,6 @@ mod hash;
 mod key;
 mod list;
 pub mod set;
-mod stream;
+pub(crate) mod stream;
 mod string;
 mod zset;

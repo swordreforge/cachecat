@@ -1,6 +1,6 @@
-use crate::raft::types::core::mocha::core::{
-    ApplyEffects, MyCache, StreamWaiter, Update, UpdateType,
-};
+use crate::error::ProtocolError;
+use crate::raft::types::core::cache::stream::no_group_read;
+use crate::raft::types::core::mocha::core::{ApplyEffects, MyCache, StreamWaiter, Update};
 use crate::raft::types::core::response_value::Value;
 use crate::raft::types::core::structure::stream::AddId;
 use crate::raft::types::core::value_object::ValueObject;
@@ -298,6 +298,12 @@ pub fn do_request(
                 .as_deref_mut()
                 .expect("effects require an execution guard");
             for key in effects.changed_streams.drain() {
+                // New entries wake exactly one waiter per (key, group): the
+                // delivery is itself a replicated write that advances the
+                // cursor, and its own apply wakes the next waiter while
+                // entries remain. Destroys are answered with NOGROUP right
+                // here, so the error path costs no Raft write at all.
+                let mut woken_groups: Vec<Bytes> = Vec::new();
                 waiters
                     .blocking_keys
                     .wake_ready(&key, |waiter| match waiter {
@@ -309,12 +315,19 @@ pub fn do_request(
                             );
                             (!matches!(result, Value::Array(None))).then_some(result)
                         }
-                        // The payload is only a token: the client submits the
-                        // authoritative group read, which also validates the
-                        // replicated generation captured before waiting.
                         StreamWaiter::Group { group, identities } => {
-                            group_waiter_ready(my_cache, &key, group, identities)
-                                .then_some(Value::ok())
+                            match group_waiter_status(my_cache, &key, group, identities) {
+                                GroupWake::Gone(error) => Some(error),
+                                GroupWake::Deliver => {
+                                    if woken_groups.iter().any(|woken| woken == group) {
+                                        None
+                                    } else {
+                                        woken_groups.push(group.clone());
+                                        Some(Value::ok())
+                                    }
+                                }
+                                GroupWake::Retain => None,
+                            }
                         }
                     });
             }
@@ -324,35 +337,49 @@ pub fn do_request(
     result
 }
 
+/// Outcome of evaluating one blocked XREADGROUP against a stream change.
+enum GroupWake {
+    /// The group is gone or was recreated: answer NOGROUP without a write.
+    Gone(Value),
+    /// New entries exist: wake one waiter per (key, group).
+    Deliver,
+    /// Nothing deliverable for this waiter.
+    Retain,
+}
+
 /// Decide whether a stream change matters to a blocked XREADGROUP. New entries
-/// wake it, and so do a destroyed or recreated group: the pending submit then
-/// fails with NOGROUP instead of silently reading the new group.
-fn group_waiter_ready(
+/// wake it, and so do a destroyed or recreated group: the latter is answered
+/// immediately with NOGROUP instead of submitting a doomed group read.
+fn group_waiter_status(
     my_cache: &MyCache,
     key: &(u16, Bytes),
     group: &Bytes,
     identities: &[((u16, Bytes), Arc<()>)],
-) -> bool {
+) -> GroupWake {
     let Some(database) = my_cache.databases.get(key.0 as usize) else {
-        return false;
+        return GroupWake::Retain;
     };
     let Some(entry) = database.mocha.get_entry(&key.1) else {
-        return true;
+        return GroupWake::Gone(no_group_read(&key.1, group));
     };
     let ValueObject::Stream(stream) = &entry.value.data else {
-        return true;
+        return GroupWake::Gone(ProtocolError::WrongType.into());
     };
     let stream = stream.read();
     let Ok(current) = stream.group_identity(group) else {
-        return true;
+        return GroupWake::Gone(no_group_read(&key.1, group));
     };
     let Some((_, expected)) = identities.iter().find(|(waited, _)| waited == key) else {
-        return true;
+        return GroupWake::Retain;
     };
     if !Arc::ptr_eq(expected, &current) {
-        return true;
+        return GroupWake::Gone(no_group_read(&key.1, group));
     }
-    stream.group_has_new(group).unwrap_or(false)
+    if stream.group_has_new(group).unwrap_or(false) {
+        GroupWake::Deliver
+    } else {
+        GroupWake::Retain
+    }
 }
 
 #[cfg(test)]
@@ -366,6 +393,7 @@ mod tests {
     use crate::protocol::stream::xread::{XReadId, XReadParams};
     use crate::protocol::transaction::QueuedOperation;
     use crate::protocol::transaction::exec::ExecParams;
+    use crate::raft::types::core::mocha::core::StreamRegistration;
     use crate::raft::types::core::mocha::core::{ApplyEffects, MyValue, UpdateType};
     use crate::raft::types::core::structure::stream::StreamId;
     use crate::raft::types::core::value_object::ValueObject;
@@ -1057,11 +1085,9 @@ mod tests {
         seed_group_at_tail(&cache, &key).await;
         let group = Bytes::from_static(b"g");
         let identities = group_identities(&cache, &key, b"g");
-        assert!(!group_waiter_ready(
-            &cache,
-            &(0, key.clone()),
-            &group,
-            &identities
+        assert!(matches!(
+            group_waiter_status(&cache, &(0, key.clone()), &group, &identities),
+            GroupWake::Retain
         ));
 
         let waiter = cache
@@ -1108,7 +1134,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn xgroup_destroy_wakes_group_waiters_with_a_token() {
+    async fn xgroup_destroy_answers_nogroup_without_a_write() {
         use futures::FutureExt;
 
         let cache = MyCache::new(2).unwrap();
@@ -1145,12 +1171,12 @@ mod tests {
             &mut effects,
         )
         .await;
-        let (_, token) = waiter
+        let (_, payload) = waiter
             .wait()
             .now_or_never()
             .expect("DESTROY must wake the blocked group read")
             .unwrap();
-        assert!(matches!(token, Value::SimpleString(_)));
+        assert!(matches!(payload, Value::Error(ref error) if error.starts_with("NOGROUP")));
 
         // A recreated group has a new generation and a new identity.
         apply(
@@ -1168,11 +1194,180 @@ mod tests {
             4,
         )
         .await;
-        assert!(group_waiter_ready(
-            &cache,
-            &(0, key.clone()),
-            &group,
-            &identities
+        assert!(matches!(
+            group_waiter_status(&cache, &(0, key.clone()), &group, &identities),
+            GroupWake::Gone(_)
         ));
+    }
+
+    async fn group_waiter(
+        cache: &MyCache,
+        key: &Bytes,
+        group: &Bytes,
+        identities: &[((u16, Bytes), Arc<()>)],
+    ) -> StreamRegistration {
+        cache
+            .write_lock
+            .lock()
+            .await
+            .register_stream(
+                vec![(0, key.clone())],
+                None,
+                StreamWaiter::Group {
+                    group: group.clone(),
+                    identities: identities.to_vec(),
+                },
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn only_one_group_waiter_wakes_per_append() {
+        use futures::FutureExt;
+
+        let cache = MyCache::new(2).unwrap();
+        let key = Bytes::from_static(b"stream");
+        seed_group_at_tail(&cache, &key).await;
+        let group = Bytes::from_static(b"g");
+        let identities = group_identities(&cache, &key, b"g");
+
+        let mut waiters = vec![
+            group_waiter(&cache, &key, &group, &identities).await,
+            group_waiter(&cache, &key, &group, &identities).await,
+            group_waiter(&cache, &key, &group, &identities).await,
+        ];
+        assert_eq!(
+            cache.write_lock.lock().await.blocking_keys.waiter_count(),
+            3
+        );
+
+        let mut effects = ApplyEffects::default();
+        apply_with_effects(&cache, xadd(&key, AddId::Auto), 0, 3, &mut effects).await;
+        assert_eq!(
+            cache.write_lock.lock().await.blocking_keys.waiter_count(),
+            2,
+            "a single append must not wake every consumer of the group"
+        );
+
+        // The oldest registration is served first; its own group read would
+        // advance the cursor and wake the next waiter while entries remain.
+        let oldest = waiters.remove(0);
+        let (_, token) = oldest
+            .wait()
+            .now_or_never()
+            .expect("oldest waiter")
+            .unwrap();
+        assert!(matches!(token, Value::SimpleString(_)));
+
+        apply_with_effects(&cache, xadd(&key, AddId::Auto), 0, 4, &mut effects).await;
+        assert_eq!(
+            cache.write_lock.lock().await.blocking_keys.waiter_count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn each_distinct_group_wakes_once_per_append() {
+        use futures::FutureExt;
+
+        let cache = MyCache::new(2).unwrap();
+        let key = Bytes::from_static(b"stream");
+        seed_group_at_tail(&cache, &key).await;
+        apply(
+            &cache,
+            Operation::Base(BaseOperation::XGroup(
+                crate::protocol::stream::xgroup::XGroupReq::Create {
+                    key: key.clone(),
+                    group: Bytes::from_static(b"h"),
+                    id: crate::raft::types::core::structure::stream::GroupStart::Last,
+                    entries_read: None,
+                    mkstream: false,
+                },
+            )),
+            0,
+            3,
+        )
+        .await;
+        let first_group = Bytes::from_static(b"g");
+        let second_group = Bytes::from_static(b"h");
+        let first = group_identities(&cache, &key, b"g");
+        let second = group_identities(&cache, &key, b"h");
+
+        let g1 = group_waiter(&cache, &key, &first_group, &first).await;
+        let g2 = group_waiter(&cache, &key, &first_group, &first).await;
+        let h1 = group_waiter(&cache, &key, &second_group, &second).await;
+        assert_eq!(
+            cache.write_lock.lock().await.blocking_keys.waiter_count(),
+            3
+        );
+
+        let mut effects = ApplyEffects::default();
+        apply_with_effects(&cache, xadd(&key, AddId::Auto), 0, 4, &mut effects).await;
+        assert_eq!(
+            cache.write_lock.lock().await.blocking_keys.waiter_count(),
+            1,
+            "one waiter per distinct group, not one per key"
+        );
+        assert!(g1.wait().now_or_never().is_some());
+        assert!(h1.wait().now_or_never().is_some());
+        // The second waiter of the first group remains blocked.
+        drop(g2);
+    }
+
+    #[tokio::test]
+    async fn destroy_answers_every_waiter_of_that_group() {
+        use futures::FutureExt;
+
+        let cache = MyCache::new(2).unwrap();
+        let key = Bytes::from_static(b"stream");
+        seed_group_at_tail(&cache, &key).await;
+        apply(
+            &cache,
+            Operation::Base(BaseOperation::XGroup(
+                crate::protocol::stream::xgroup::XGroupReq::Create {
+                    key: key.clone(),
+                    group: Bytes::from_static(b"h"),
+                    id: crate::raft::types::core::structure::stream::GroupStart::Last,
+                    entries_read: None,
+                    mkstream: false,
+                },
+            )),
+            0,
+            3,
+        )
+        .await;
+        let doomed = Bytes::from_static(b"g");
+        let survivor = Bytes::from_static(b"h");
+        let doomed_identities = group_identities(&cache, &key, b"g");
+        let survivor_identities = group_identities(&cache, &key, b"h");
+
+        let first = group_waiter(&cache, &key, &doomed, &doomed_identities).await;
+        let second = group_waiter(&cache, &key, &doomed, &doomed_identities).await;
+        let survivor_waiter = group_waiter(&cache, &key, &survivor, &survivor_identities).await;
+
+        let mut effects = ApplyEffects::default();
+        apply_with_effects(
+            &cache,
+            Operation::Base(BaseOperation::XGroup(
+                crate::protocol::stream::xgroup::XGroupReq::Destroy {
+                    key: key.clone(),
+                    group: doomed.clone(),
+                },
+            )),
+            0,
+            4,
+            &mut effects,
+        )
+        .await;
+        assert_eq!(
+            cache.write_lock.lock().await.blocking_keys.waiter_count(),
+            1,
+            "only the unrelated group stays blocked"
+        );
+        for waiter in [first, second] {
+            let (_, payload) = waiter.wait().now_or_never().unwrap().unwrap();
+            assert!(matches!(payload, Value::Error(ref error) if error.starts_with("NOGROUP")));
+        }
+        drop(survivor_waiter);
     }
 }

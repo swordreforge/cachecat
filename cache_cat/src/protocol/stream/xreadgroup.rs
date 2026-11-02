@@ -482,9 +482,13 @@ impl XReadGroupParams {
             };
             if let Some(registration) = registration {
                 match registration.wait().await {
-                    // The payload is only a readiness token: the authoritative
-                    // group read below is what assigns the PEL entries.
-                    Ok(_) => {}
+                    // A destroyed or recreated group is answered directly with
+                    // NOGROUP; a token means the group read below should run.
+                    Ok((_, payload)) => {
+                        if matches!(payload, Value::Error(_)) {
+                            return Ok(payload);
+                        }
+                    }
                     Err(WaitError::Timeout) => return Ok(Value::Array(None)),
                     Err(WaitError::Closed) => {
                         return Err(Error::internal("blocking registry is closed").into());

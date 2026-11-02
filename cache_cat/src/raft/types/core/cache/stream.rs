@@ -1,9 +1,33 @@
+use crate::error::ProtocolError;
 use crate::protocol::stream::xack::XAckReq;
 use crate::protocol::stream::xclaim::XClaimReq;
 use crate::protocol::stream::xgroup::XGroupReq;
 use crate::protocol::stream::xreadgroup::XReadGroupStreamReq;
 use crate::raft::types::core::mocha::core::{MyCache, Update};
 use crate::raft::types::core::response_value::Value;
+use bytes::Bytes;
+
+/// `NOGROUP` reply for XCLAIM and XPENDING. Lives next to the state machine so
+/// the blocking dispatcher can answer a destroyed group without an extra Raft
+/// write.
+pub(crate) fn no_group(key: &Bytes, group: &Bytes) -> Value {
+    ProtocolError::response(format!(
+        "NOGROUP No such key '{}' or consumer group '{}'",
+        String::from_utf8_lossy(key),
+        String::from_utf8_lossy(group)
+    ))
+    .into()
+}
+
+/// XREADGROUP appends a hint about the missing GROUP option, matching Redis.
+pub(crate) fn no_group_read(key: &Bytes, group: &Bytes) -> Value {
+    ProtocolError::response(format!(
+        "NOGROUP No such key '{}' or consumer group '{}' in XREADGROUP with GROUP option",
+        String::from_utf8_lossy(key),
+        String::from_utf8_lossy(group)
+    ))
+    .into()
+}
 
 impl MyCache {
     pub fn x_group(&self, param: XGroupReq, update: &mut Update) -> Value {

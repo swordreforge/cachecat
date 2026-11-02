@@ -68,22 +68,6 @@ pub(super) fn parse_interval(
     Ok((start, end))
 }
 
-/// `NOGROUP` reply for XCLAIM and XPENDING.
-pub(super) fn no_group(key: &Bytes, group: &Bytes) -> Value {
-    ProtocolError::response(format!(
-        "NOGROUP No such key '{}' or consumer group '{}'",
-        String::from_utf8_lossy(key),
-        String::from_utf8_lossy(group)
-    ))
-    .into()
-}
-
-/// XREADGROUP appends a hint about the missing GROUP option, matching Redis.
-pub(super) fn no_group_read(key: &Bytes, group: &Bytes) -> Value {
-    ProtocolError::response(format!(
-        "NOGROUP No such key '{}' or consumer group '{}' in XREADGROUP with GROUP option",
-        String::from_utf8_lossy(key),
-        String::from_utf8_lossy(group)
-    ))
-    .into()
-}
+// The NOGROUP replies live in the state-machine layer so the blocking
+// dispatcher can reuse them. Re-exported here for the stream commands.
+pub(crate) use crate::raft::types::core::cache::stream::{no_group, no_group_read};
