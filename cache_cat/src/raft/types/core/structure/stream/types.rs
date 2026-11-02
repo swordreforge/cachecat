@@ -131,7 +131,7 @@ pub struct ReadGroupOptions {
     pub no_ack: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeliveryTime {
     #[default]
     Now,
@@ -139,7 +139,7 @@ pub enum DeliveryTime {
     UnixMs(u64),
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimOptions {
     pub min_idle_ms: u64,
     pub force: bool,

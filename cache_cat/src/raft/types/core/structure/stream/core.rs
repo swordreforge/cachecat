@@ -606,6 +606,20 @@ impl RedisStream {
         options: ReadGroupOptions,
     ) -> Result<Vec<GroupEntry>> {
         let now = self.clock.now_ms();
+        self.xreadgroup_at(name, consumer, mode, options, now)
+    }
+
+    /// `now` must come from the replicated write clock: delivery timestamps and
+    /// consumer activity are state, so every replica has to record the same
+    /// value instead of its own wall clock.
+    pub fn xreadgroup_at(
+        &mut self,
+        name: &[u8],
+        consumer: &[u8],
+        mode: GroupRead,
+        options: ReadGroupOptions,
+        now: u64,
+    ) -> Result<Vec<GroupEntry>> {
         let meta = self.meta();
         let group = self.groups.get_mut(name).ok_or(StreamError::NoGroup)?;
         group.touch(consumer, now);
@@ -668,6 +682,22 @@ impl RedisStream {
         Ok(result)
     }
 
+    /// Whether a consumer group exists. XACK answers 0 (not NOGROUP) for a
+    /// missing group, but Redis checks that before it parses any ID.
+    pub fn has_group(&self, name: &[u8]) -> bool {
+        self.groups.contains_key(name)
+    }
+
+    /// Delivery cursor of a consumer group. XREADGROUP arms a local waiter with
+    /// it so that only entries strictly after the cursor wake the client.
+    pub fn group_last_delivered(&self, name: &[u8]) -> Result<StreamId> {
+        Ok(self
+            .groups
+            .get(name)
+            .ok_or(StreamError::NoGroup)?
+            .last_delivered)
+    }
+
     /// Missing group is a zero acknowledgement count, not NOGROUP.
     pub fn xack(&mut self, name: &[u8], ids: &[StreamId]) -> usize {
         let Some(group) = self.groups.get_mut(name) else {
@@ -696,11 +726,22 @@ impl RedisStream {
     }
 
     pub fn xpending_range(&self, name: &[u8], query: PendingQuery<'_>) -> Result<Vec<PendingInfo>> {
+        let now = self.clock.now_ms();
+        self.xpending_range_at(name, query, now)
+    }
+
+    /// See `xreadgroup_at`: idle times must be derived from a duplicated clock
+    /// when the reply is produced inside a replicated EXEC or Lua script.
+    pub fn xpending_range_at(
+        &self,
+        name: &[u8],
+        query: PendingQuery<'_>,
+        now: u64,
+    ) -> Result<Vec<PendingInfo>> {
         let g = self.groups.get(name).ok_or(StreamError::NoGroup)?;
         let Some((lo, hi)) = query.range.normalized() else {
             return Ok(Vec::new());
         };
-        let now = self.clock.now_ms();
         let entries = g
             .pel
             .range::<Key, _>((Bound::Included(lo.to_key()), Bound::Included(hi.to_key())))
@@ -724,6 +765,19 @@ impl RedisStream {
         options: ClaimOptions,
     ) -> Result<ClaimReply> {
         let now = self.clock.now_ms();
+        self.xclaim_at(name, consumer, ids, options, now)
+    }
+
+    /// See `xreadgroup_at`: `now` is the replicated write clock, so claims
+    /// record identical delivery timestamps on every replica.
+    pub fn xclaim_at(
+        &mut self,
+        name: &[u8],
+        consumer: &[u8],
+        ids: &[StreamId],
+        options: ClaimOptions,
+        now: u64,
+    ) -> Result<ClaimReply> {
         let delivery = match options.delivery_time {
             DeliveryTime::Now => now,
             DeliveryTime::IdleMs(idle) => now.checked_sub(idle).unwrap_or(now),

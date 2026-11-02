@@ -94,9 +94,15 @@ use crate::protocol::set::srandmember::SRandMemberCommand;
 use crate::protocol::set::srem::SRemCommand;
 use crate::protocol::set::sunion::SUnionCommand;
 use crate::protocol::set::sunionstore::SUnionStoreCommand;
+use crate::protocol::stream::xack::XAckCommand;
 use crate::protocol::stream::xadd::XAddCommand;
+use crate::protocol::stream::xclaim::XClaimCommand;
 use crate::protocol::stream::xgroup::XGroupCommand;
+use crate::protocol::stream::xlen::XLenCommand;
+use crate::protocol::stream::xpending::XPendingCommand;
+use crate::protocol::stream::xrange::XRangeCommand;
 use crate::protocol::stream::xread::XReadCommand;
+use crate::protocol::stream::xreadgroup::XReadGroupCommand;
 use crate::protocol::string::append::AppendCommand;
 use crate::protocol::string::decr::DecrCommand;
 use crate::protocol::string::decrby::DecrByCommand;
@@ -466,6 +472,12 @@ impl CommandFactory {
         factory.register("XADD", XAddCommand);
         factory.register("XREAD", XReadCommand);
         factory.register("XGROUP", XGroupCommand);
+        factory.register("XLEN", XLenCommand);
+        factory.register("XRANGE", XRangeCommand);
+        factory.register("XACK", XAckCommand);
+        factory.register("XREADGROUP", XReadGroupCommand);
+        factory.register("XPENDING", XPendingCommand);
+        factory.register("XCLAIM", XClaimCommand);
         factory
     }
 

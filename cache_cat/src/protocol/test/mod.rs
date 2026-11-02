@@ -12,3 +12,6 @@ mod transaction_tests;
 
 #[cfg(test)]
 mod hscan_snapshot_tests;
+
+#[cfg(test)]
+mod stream_command_tests;

@@ -26,6 +26,9 @@ fn read_request_inner<const REPLICATED: bool>(
         ReadOperation::LRange(param) => my_cache.execute_read(param, db_number, read_clock),
         ReadOperation::MGet(param) => my_cache.execute_multi_read(param, db_number, read_clock),
         ReadOperation::XRead(param) => my_cache.execute_multi_read(param, db_number, read_clock),
+        ReadOperation::XLen(param) => my_cache.execute_read(param, db_number, read_clock),
+        ReadOperation::XRange(param) => my_cache.execute_read(param, db_number, read_clock),
+        ReadOperation::XPending(param) => my_cache.execute_read(param, db_number, read_clock),
         ReadOperation::ZRange(param) => my_cache.execute_read(param, db_number, read_clock),
         ReadOperation::HGet(param) => my_cache.execute_read(param, db_number, read_clock),
         ReadOperation::SMembers(param) => {
@@ -196,6 +199,9 @@ fn base_request_inner(
         BaseOperation::BfInsert(param) => my_cache.bf_insert(param, update),
         BaseOperation::BfLoadChunk(param) => my_cache.bf_load(param, update),
         BaseOperation::XGroup(param) => my_cache.x_group(param, update),
+        BaseOperation::XAck(param) => my_cache.x_ack(param, update),
+        BaseOperation::XReadGroup(param) => my_cache.x_read_group(param, update),
+        BaseOperation::XClaim(param) => my_cache.x_claim(param, update),
     }
 }
 
@@ -286,6 +292,9 @@ pub fn do_request(
             RedisOperation::RedisEvalSha { .. } => {
                 // Unresolved hashes must never consult replica-local script caches.
                 Value::error("unresolved EVALSHA in replicated request")
+            }
+            RedisOperation::RedisXReadGroup(param) => {
+                my_cache.redis_xreadgroup(param, update, external)
             }
         },
     };

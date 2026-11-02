@@ -33,6 +33,9 @@ use crate::protocol::set::sismember::SIsMemberParams;
 use crate::protocol::set::smembers::SMembersParams;
 use crate::protocol::set::srandmember::SRandMemberParams;
 use crate::protocol::set::sunion::SUnionParams;
+use crate::protocol::stream::xlen::XLenParams;
+use crate::protocol::stream::xpending::XPendingParams;
+use crate::protocol::stream::xrange::XRangeParams;
 use crate::protocol::stream::xread::XReadParams;
 use crate::protocol::string::get::GetParams;
 use crate::protocol::string::len::StrLenParams;
@@ -98,4 +101,9 @@ pub enum ReadOperation {
     XRead(XReadParams),
     HScan(HScanParams),
     ZScan(ZScanParams),
+    /// Appended after the existing variants so serialized operations keep
+    /// their variant indices.
+    XLen(XLenParams),
+    XRange(XRangeParams),
+    XPending(XPendingParams),
 }

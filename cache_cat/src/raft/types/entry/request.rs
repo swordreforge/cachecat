@@ -92,6 +92,13 @@ pub enum RedisOperation {
     /// Local observability output.  The server-side fields are resolved at
     /// EXEC time; keyspace fields are rendered while the log is applied.
     RedisInfo(InfoParams),
+    /// Multi-key consumer-group read. Applies one `XReadGroupStreamReq` per key
+    /// so a snapshot records single-key deltas.
+    ///
+    /// Must stay *before* `RedisEvalSha`: serde's derive counts the skipped
+    /// variant when encoding but not when decoding, so variants declared after
+    /// a skipped one would be written with an out-of-range index.
+    RedisXReadGroup(crate::protocol::stream::xreadgroup::XReadGroupReq),
     /// Local MULTI placeholder; EXEC must resolve the script before replication.
     #[serde(skip)]
     RedisEvalSha {
@@ -107,6 +114,9 @@ impl fmt::Display for Request {
                 ReadOperation::Get(req) => write!(f, "Get: {}", req),
                 ReadOperation::MGet(req) => write!(f, "MGet: {}", req),
                 ReadOperation::XRead(req) => write!(f, "XRead: {}", req),
+                ReadOperation::XLen(req) => write!(f, "XLen: {}", req),
+                ReadOperation::XRange(req) => write!(f, "XRange: {}", req),
+                ReadOperation::XPending(req) => write!(f, "XPending: {}", req),
                 ReadOperation::ZRange(req) => write!(f, "ZRange: {}", req),
                 ReadOperation::Exists(req) => write!(f, "Exists: {}", req),
                 ReadOperation::LRange(req) => write!(f, "LRange: {}", req),
@@ -200,6 +210,9 @@ impl fmt::Display for Request {
                 BaseOperation::BfInsert(req) => write!(f, "BfInsert: {}", req),
                 BaseOperation::BfLoadChunk(req) => write!(f, "BfLoadChunk: {}", req),
                 BaseOperation::XGroup(req) => write!(f, "XGroup: {}", req),
+                BaseOperation::XAck(req) => write!(f, "XAck: {}", req),
+                BaseOperation::XReadGroup(req) => write!(f, "XReadGroup: {}", req),
+                BaseOperation::XClaim(req) => write!(f, "XClaim: {}", req),
             },
             Operation::Redis(op) => match op {
                 RedisOperation::RedisSet(req) => write!(f, "RedisSet: {}", req),
@@ -224,6 +237,7 @@ impl fmt::Display for Request {
                 RedisOperation::RedisEvalSha { params, .. } => {
                     write!(f, "RedisEvalSha: {}", params)
                 }
+                RedisOperation::RedisXReadGroup(req) => write!(f, "RedisXReadGroup: {}", req),
             },
         }
     }

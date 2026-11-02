@@ -120,7 +120,8 @@ fn entry_wire_size(id: StreamId, fields: &Fields) -> usize {
             .sum::<usize>()
 }
 
-fn xread_entry(entry: Entry) -> Value {
+/// Shared reply shape for every stream entry: `[id, [field, value, ...]]`.
+pub(super) fn entry_reply(entry: Entry) -> Value {
     let id = entry.id.to_string();
     let field_count = entry.fields.len() * 2;
     let mut fields = Vec::with_capacity(field_count);
@@ -468,7 +469,7 @@ impl MultiReadCommand for XReadParams {
                 continue;
             }
             total_entries += entries.len();
-            let stream_entries = entries.into_iter().map(xread_entry).collect();
+            let stream_entries = entries.into_iter().map(entry_reply).collect();
             result.push((
                 Value::BulkString(Some(key.clone())),
                 Value::Array(Some(stream_entries)),
