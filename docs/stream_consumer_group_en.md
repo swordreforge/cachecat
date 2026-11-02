@@ -17,7 +17,8 @@ The work has two parts:
 2. turn blocking wake-ups into "any stream write publishes a generic change event and each
    waiter re-checks its own state".
 
-A follow-up batch then added the read-only `XREVRANGE` and `XINFO` (section 2.2).
+A follow-up batch then added the read-only `XREVRANGE` and `XINFO` (section 2.2), and a
+second batch added `XDEL` and `XTRIM` (section 2.3).
 
 ## 2. Commands
 
@@ -31,9 +32,12 @@ A follow-up batch then added the read-only `XREVRANGE` and `XINFO` (section 2.2)
 | `XREADGROUP` | multi-key write | `RedisOperation::RedisXReadGroup` + per-key `BaseOperation::XReadGroup` | atomic across keys, snapshots record single-key deltas |
 | `XREVRANGE` | `ReadCommand` | `ReadOperation::XRevRange` | reverse interval plus `COUNT` |
 | `XINFO` | `ReadCommand` | `ReadOperation::XInfo` | `STREAM` / `GROUPS` / `CONSUMERS` / `HELP` |
+| `XDEL` | `ComputeCommand` | `BaseOperation::XDel` | removes entries |
+| `XTRIM` | `ComputeCommand` | `BaseOperation::XTrim` | trims with a reference policy |
 
-All eight are registered in both the server factory and the Lua factory, so they work inside
-`MULTI/EXEC` and `EVAL`; the last two arrived in the follow-up read-only batch.
+All ten are registered in both the server factory and the Lua factory, so they work inside
+`MULTI/EXEC` and `EVAL`; the last four arrived in the follow-up read-only and delete/trim
+batches.
 
 ### 2.1 Redis-compatible details
 
@@ -72,6 +76,28 @@ Checked against `redis/8.0` `src/t_stream.c`:
 - **Field choice**: cache-cat stores entries in a B-tree rather than a radix tree, so the
   internal `radix-tree-keys`/`radix-tree-nodes` fields are omitted; every other field is
   reported with Redis semantics.
+
+### 2.3 Delete and trim follow-up
+
+- **XDEL**: Redis checks the key, then its type, and only then parses IDs, so a missing key
+  answers `0` even for a malformed ID. The replicated request keeps raw IDs and validates
+  them inside `mutate` after the type check. Deleting removes payloads only: PEL records,
+  group cursors and the last-generated ID survive, `max-deleted-entry-id` advances only for
+  IDs actually removed, and duplicate IDs count once.
+- **XTRIM**: supports `MAXLEN`/`MINID`, optional `~`/`=`, `LIMIT n`, and the Redis 8.2
+  `KEEPREF`/`DELREF`/`ACKED` reference policies. Options are parsed before the key lookup,
+  so an invalid option is an error even for a missing key; a missing key itself answers `0`
+  and is not created.
+  - `LIMIT` requires `~`, `0` means unlimited, negative `MAXLEN`/`LIMIT` report Redis'
+    dedicated messages, and `MAXLEN` and `MINID` are mutually exclusive. Without an explicit
+    `LIMIT`, `~` uses the core's 10,000-entry examination cap.
+  - `KEEPREF` (default) leaves the PEL alone, `DELREF` clears PEL references for trimmed
+    entries, and `ACKED` trims only entries no group still references.
+  - Unlike XDEL, XTRIM does not advance `max-deleted-entry-id`.
+- **Snapshots and wake-ups**: `TrimOptions` is serializable, so snapshot deltas and Raft
+  logs replay the exact mode, limit and policy. Neither command appends entries, so the
+  `changed_streams` append flag stays false and blocked XREAD/XREADGROUP clients sleep until
+  the next XADD.
 
 ## 3. Replication and snapshots
 
@@ -117,26 +143,27 @@ Checked against `redis/8.0` `src/t_stream.c`:
 
 ## 6. Verification
 
-- `cargo test -p cache_cat --lib -- --skip test::tests::test_add` → **550 passed / 0 failed**
+- `cargo test -p cache_cat --lib -- --skip test::tests::test_add` → **571 passed / 0 failed**
   (`test_add` needs a live node on port 5001).
-- Coverage includes argument/boundary/error text for all eight commands, PEL equality after
+- Coverage includes argument/boundary/error text for all ten commands, PEL equality after
   snapshot replay, generation round-trips and rejection, one wake per group, per-group
   independent wakes, `NOGROUP` after destroy, no XREAD scans on non-append changes,
-  XREVRANGE's end/start reversal, and XINFO's RESP2/RESP3 shapes and clock-derived times.
+  XREVRANGE's end/start reversal, XINFO's RESP2/RESP3 shapes and clock-derived times, and
+  XDEL/XTRIM snapshot replay and reference policies.
 - Real single node: `BLOCK 0` plus `XGROUP DESTROY` answers `NOGROUP` immediately; one append
   serves one of three blocked consumers and the next append serves the next; destroying another
   group leaves the waiter asleep; destroy+recreate plus `XADD` answers `NOGROUP` with an empty
   new PEL; two entries written in one `EVAL` are delivered through chained wake-ups; an `XACK`
   no longer wakes a blocked `XREAD`; XREVRANGE and XINFO (RESP2/RESP3, HELP, NOGROUP,
-  MULTI/EXEC and EVAL) behave correctly; snapshots are written as `MCDC\x02` and restore data
-  and PEL after a restart.
+  MULTI/EXEC and EVAL) behave correctly; XDEL/XTRIM handle deletion, trimming, LIMIT and all
+  reference policies through MULTI/EXEC and EVAL, and blocked readers only wake on an append;
+  snapshots are written as `MCDC\x02` and restore data and PEL after a restart.
 
 ## 7. Known limits and next steps
 
-- Remaining stream commands are not exposed yet: `XAUTOCLAIM`, `XACKDEL`/`XDELEX`, `XTRIM`,
-  `XDEL` and `XSETID`. All exist in the core; the suggested order is `XDEL`/`XTRIM` first,
-  then `XAUTOCLAIM` after adding `xautoclaim_at`, and finally `XSETID` plus the Redis 8
-  `XACKDEL`/`XDELEX`.
+- Remaining stream commands are not exposed yet: `XAUTOCLAIM`, `XACKDEL`/`XDELEX` and
+  `XSETID`. All exist in the core; the suggested order is `XAUTOCLAIM` after adding
+  `xautoclaim_at`, then `XSETID` plus the Redis 8 `XACKDEL`/`XDELEX`.
 - `DEL key` does not wake blocked clients, matching Redis (DEL produces no stream readiness).
 - The first submit of a blocking read is still a Raft write; an empty read still creates or
   touches the consumer, as Redis does.
@@ -146,6 +173,7 @@ Checked against `redis/8.0` `src/t_stream.c`:
 ## 8. Commits
 
 ```
+e4c159d add XDEL and XTRIM stream commands
 91e8886 add XREVRANGE and XINFO stream commands
 db95a9f trim allocations on the stream wake path
 c4ecf53 skip useless XREAD scans on non-append stream changes

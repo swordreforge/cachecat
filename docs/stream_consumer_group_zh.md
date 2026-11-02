@@ -15,7 +15,8 @@
 1. 补齐 `XLEN`、`XRANGE`、`XACK`、`XREADGROUP`、`XPENDING`、`XCLAIM` 六个命令；
 2. 把阻塞唤醒从"只有追加才有事件"重构成"任意 stream 写入产生通用变更事件 + 等待者自检"。
 
-之后又完成了第一批只读扩展，补齐 `XREVRANGE` 与 `XINFO`（见 2.2）。
+之后又完成了两批增量：第一批补齐只读的 `XREVRANGE` 与 `XINFO`（见 2.2），
+第二批补齐删除/裁剪的 `XDEL` 与 `XTRIM`（见 2.3）。
 
 ## 2. 新增命令
 
@@ -29,9 +30,12 @@
 | `XREADGROUP` | 多键读写 | `RedisOperation::RedisXReadGroup` + 每键 `BaseOperation::XReadGroup` | 原子多键，快照按单键记录 |
 | `XREVRANGE` | `ReadCommand` | `ReadOperation::XRevRange` | 单键读，反向区间 + `COUNT` |
 | `XINFO` | `ReadCommand` | `ReadOperation::XInfo` | `STREAM` / `GROUPS` / `CONSUMERS` / `HELP` |
+| `XDEL` | `ComputeCommand` | `BaseOperation::XDel` | 单键读改写，删除条目 |
+| `XTRIM` | `ComputeCommand` | `BaseOperation::XTrim` | 单键读改写，裁剪 + 引用策略 |
 
-八个命令同时注册到服务端工厂 `CommandFactory` 和 Lua 工厂 `RaftCommandFactory`，
-因此 `MULTI/EXEC` 与 `EVAL` 中同样可用。`XREVRANGE` / `XINFO` 属于后续第一批只读扩展。
+十个命令同时注册到服务端工厂 `CommandFactory` 和 Lua 工厂 `RaftCommandFactory`，
+因此 `MULTI/EXEC` 与 `EVAL` 中同样可用。`XREVRANGE` / `XINFO` 属于第一批只读扩展，
+`XDEL` / `XTRIM` 属于第二批删除/裁剪扩展。
 
 ### 2.1 与 Redis 语义对齐的细节
 
@@ -70,6 +74,25 @@
 - **字段取舍**：cache-cat 用 B 树而不是 radix tree 存储条目，所以不输出 Redis 内部的
   `radix-tree-keys` / `radix-tree-nodes`，其余字段（长度、首尾条目、组、PEL、
   消费者时间等）均按 Redis 语义输出。
+
+### 2.3 删除与裁剪（第二批）
+
+- **XDEL**：Redis 先查 key、再查类型，**最后**才解析 ID，因此缺 key 时即使 ID 非法也
+  返回 `0`。复制的请求保留原始 ID 字节，在 `mutate` 里类型检查通过后再解析，保证错误
+  顺序一致。删除只移除 payload：PEL、group 游标和 `last-generated-id` 保留，
+  只有真正删掉的 ID 才推进 `max-deleted-entry-id`；重复 ID 只计一次。
+- **XTRIM**：支持 `MAXLEN` / `MINID`、可选 `~` / `=`、`LIMIT n`，以及 Redis 8.2 的
+  `KEEPREF` / `DELREF` / `ACKED` 引用策略。选项在查 key **之前**解析，所以缺 key 时
+  非法参数仍然报错；缺 key 本身返回 `0` 且不创建。
+  - `LIMIT` 只能与 `~` 同用，`0` 表示不限；`MAXLEN` / `LIMIT` 为负分别报
+    Redis 原文错误；`MAXLEN` 与 `MINID` 不能同时出现。未给 `LIMIT` 的 `~` 使用核心的
+    10,000 条检查上限。
+  - `KEEPREF`（默认）保留 PEL；`DELREF` 同时清理被裁剪条目的 PEL 引用；
+    `ACKED` 只裁剪已不被任何 group 引用的条目。
+  - 与 XDEL 不同，XTRIM 不推进 `max-deleted-entry-id`。
+- **快照与唤醒**：`TrimOptions` 已可序列化，快照增量与 Raft 日志能原样重放
+  `~`/`LIMIT`/引用策略；两者都不追加条目，因此 `changed_streams` 的 append 标志为
+  false，阻塞中的 XREAD / XREADGROUP 不会被删除或裁剪唤醒，直到下一次 XADD。
 
 ## 3. 复制与快照
 
@@ -173,11 +196,11 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
 ## 6. 测试与验证
 
 - 单元 + 集成测试：`cargo test -p cache_cat --lib -- --skip test::tests::test_add`
-  → **550 passed / 0 failed**（`test_add` 是需要本地 5001 节点的手工测试）。
-- 覆盖点：八个命令的参数/边界/错误文案、快照回放后的 PEL 一致性、generation 快照往返与
+  → **571 passed / 0 failed**（`test_add` 是需要本地 5001 节点的手工测试）。
+- 覆盖点：十个命令的参数/边界/错误文案、快照回放后的 PEL 一致性、generation 快照往返与
   越界拒绝、过期 generation 被拒、单 group 单唤醒、多 group 各自唤醒、销毁后全部收到
   `NOGROUP`、非追加事件不扫描 XREAD、`XREVRANGE` 的 end/start 反转、`XINFO` 的
-  RESP2/RESP3 形状与逻辑时钟时间。
+  RESP2/RESP3 形状与逻辑时钟时间、`XDEL`/`XTRIM` 的快照增量重放与引用策略。
 - 真实单节点（debug 构建）验证：
   - `BLOCK 0` + `XGROUP DESTROY` → 立即收到 `NOGROUP`（不再永久挂起）；
   - 3 个阻塞消费者 + 一次 XADD → 只有 1 个被服务；下一次 XADD → 下一个；
@@ -187,14 +210,16 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
   - `XACK` 不唤醒阻塞的 XREAD，`XADD` 才唤醒；
   - `XREVRANGE` 反向返回、`COUNT` 与缺 key 行为正确；`XINFO` 的 RESP2 扁平数组与
     RESP3 map、`HELP`、`NOGROUP` 文案、`MULTI/EXEC` 入队与 `EVAL` 调用均正确；
+  - `XDEL` / `XTRIM` 的删除、裁剪、`LIMIT`、`KEEPREF`/`DELREF`/`ACKED`、`MULTI/EXEC`
+    与 `EVAL` 均正确；阻塞中的 XREAD / XREADGROUP 不会被删除或裁剪唤醒，下一次 XADD
+    才唤醒；
   - 快照写入头部为 `MCDC\x02`，重启后数据、消费者组与 PEL 正常恢复。
 
 ## 7. 已知限制与后续方向
 
-- **Redis 8 其余 stream 命令**尚未暴露：`XAUTOCLAIM`、`XACKDEL`/`XDELEX`、`XTRIM`、
-  `XDEL`、`XSETID`。core 均已实现，属协议层适配工作。建议顺序：先 `XDEL`/`XTRIM`，
-  再补 `xautoclaim_at` 后做 `XAUTOCLAIM`，最后 `XSETID` 与 Redis 8 的
-  `XACKDEL`/`XDELEX`。
+- **Redis 8 其余 stream 命令**尚未暴露：`XAUTOCLAIM`、`XACKDEL`/`XDELEX`、`XSETID`。
+  core 均已实现，属协议层适配工作。建议顺序：先补 `xautoclaim_at` 后做
+  `XAUTOCLAIM`，最后 `XSETID` 与 Redis 8 的 `XACKDEL`/`XDELEX`。
 - `DEL key` 不会唤醒阻塞客户端，与 Redis 的行为一致（DEL 不产生 stream 就绪信号）。
 - 阻塞的首次提交仍是一次 Raft 写（与 Redis 一致：空读也要创建/更新 consumer）。
 - 若等待期间 group 被销毁，客户端在收到 `NOGROUP` 时不会重试；这符合 Redis 语义。
@@ -204,6 +229,7 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
 ## 8. 提交列表
 
 ```
+e4c159d add XDEL and XTRIM stream commands
 91e8886 add XREVRANGE and XINFO stream commands
 db95a9f trim allocations on the stream wake path
 c4ecf53 skip useless XREAD scans on non-append stream changes
