@@ -213,18 +213,17 @@ enum StreamWaiter {
 - 唤醒路径使用 `execute_multi_read_ref`，不再为每个阻塞的 XREAD 读者克隆
   `XReadParams`（keys/ids 向量）。
 
-### 4.5 DEL 删除 stream
+### 4.5 DEL / UNLINK 删除与覆盖写
 
 - Redis 只为 XREADGROUP 的等待者设置 `unblock_on_nokey`，因此删除 stream key 时：
   - 阻塞中的 `XREADGROUP` 立即收到 `NOGROUP`；
   - 普通 `XREAD` 保持阻塞，直到下一次 `XADD`。
-- 实现上，`DEL`（单键 `BaseOperation::Del` 与多键 `RedisDel` 都会逐 key 调用 `del`）
-  在真正移除 stream 后，若该 key 上有等待者，就往 `changed_streams` 写入
-  `(key, false)` 的非追加事件。分派器原有的“非追加事件只评估 group 等待者”规则直接
-  复用，无需新增唤醒分支。
+- 实现上，`DEL` / `UNLINK`（单键路径与多键路径都会逐 key 调用）在真正移除 stream 后，
+  若该 key 上有等待者，就往 `changed_streams` 写入 `(key, false)` 的非追加事件。
+  分派器原有的“非追加事件只评估 group 等待者”规则直接复用，无需新增唤醒分支。
+- `SET` / `MSET` 等覆盖写把 stream 替换成其它类型时，`execute_compute` 也会发布同一种
+  非追加事件；group 等待者重新检查后看到 `WRONGTYPE`，普通 `XREAD` 仍然不动。
 - 没有等待者时不记录事件；快照回放 `effects` 为 `None`，不受影响。
-- 局限：`UNLINK` 以及 `SET` 覆盖 stream 的路径尚未统一接入；Redis 8 的 `UNLINK`
-  同样会唤醒阻塞组读。
 
 ## 5. 本轮顺带修复的两个既有问题
 
@@ -249,13 +248,14 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
 ## 6. 测试与验证
 
 - 单元 + 集成测试：`cargo test -p cache_cat --lib -- --skip test::tests::test_add`
-  → **620 passed / 0 failed**（`test_add` 是需要本地 5001 节点的手工测试）。
+  → **622 passed / 0 failed**（`test_add` 是需要本地 5001 节点的手工测试）。
 - 覆盖点：十四个命令的参数/边界/错误文案、快照回放后的 PEL 一致性、generation 快照往返与
   越界拒绝、过期 generation 被拒、单 group 单唤醒、多 group 各自唤醒、销毁后全部收到
   `NOGROUP`、非追加事件不扫描 XREAD、`XREVRANGE` 的 end/start 反转、`XINFO` 的
   RESP2/RESP3 形状与逻辑时钟时间、`XDEL`/`XTRIM` 的快照增量重放与引用策略、
   `XAUTOCLAIM` 的游标/COUNT/JUSTID/删除清理与确定性写时钟、`XSETID` 的元数据校验、
-  `XACKDEL`/`XDELEX` 的状态数组与引用策略、DEL 对 group/普通 XREAD 的差异化唤醒。
+  `XACKDEL`/`XDELEX` 的状态数组与引用策略、DEL/UNLINK 与覆盖写对 group/普通 XREAD
+  的差异化唤醒。
 - 真实单节点（debug 构建）验证：
   - `BLOCK 0` + `XGROUP DESTROY` → 立即收到 `NOGROUP`（不再永久挂起）；
   - 3 个阻塞消费者 + 一次 XADD → 只有 1 个被服务；下一次 XADD → 下一个；
@@ -272,8 +272,9 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
     错误优先级、`MULTI/EXEC` 与 `EVAL` 均正确；
   - `XSETID` 的元数据更新与全部错误分支、`XACKDEL`/`XDELEX` 的状态数组与
     `KEEPREF`/`DELREF`/`ACKED`、`MULTI/EXEC` 与 `EVAL` 均正确；
-  - `DEL` 删除 stream 后，阻塞的 XREADGROUP 立即收到 `NOGROUP`；普通 XREAD 保持阻塞，
-    下一次 XADD 才唤醒；单键/多键 DEL 与 `MULTI` 内的 DEL 行为一致；
+  - `DEL` / `UNLINK` 删除 stream 后，阻塞的 XREADGROUP 立即收到 `NOGROUP`；`SET` /
+    `MSET` 覆盖 stream 时收到 `WRONGTYPE`；普通 XREAD 均保持阻塞，下一次 XADD 才唤醒；
+    单键/多键路径与 `MULTI`、`EVAL` 行为一致；
   - 快照写入头部为 `MCDC\x02`，重启后数据、消费者组与 PEL 正常恢复。
 
 ## 7. 已知限制与后续方向
@@ -281,8 +282,6 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
 - **Redis Stream 命令面已补齐**：`XLEN`、`XRANGE`、`XREVRANGE`、`XINFO`、`XACK`、
   `XACKDEL`、`XCLAIM`、`XAUTOCLAIM`、`XDEL`、`XDELEX`、`XTRIM`、`XSETID`、`XGROUP`、
   `XREAD`、`XREADGROUP`、`XADD` 均已暴露。
-- `DEL` 删除 stream 现在会立即唤醒阻塞中的 `XREADGROUP`（返回 `NOGROUP`），普通
-  `XREAD` 仍保持阻塞；`UNLINK` 与 `SET` 覆盖 stream 尚未接入同一路径。
 - 阻塞的首次提交仍是一次 Raft 写（与 Redis 一致：空读也要创建/更新 consumer）。
 - 若等待期间 group 被销毁，客户端在收到 `NOGROUP` 时不会重试；这符合 Redis 语义。
 - 服务端仍使用 `Arc<RwLock<RedisStream>>`，`SharedStream` 自带的 Notify 阻塞栈未被使用；
@@ -291,6 +290,7 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
 ## 8. 提交列表
 
 ```
+ad05cc7 wake blocked consumer groups on UNLINK and stream overwrite
 3c6666f wake blocked consumer groups when DEL removes a stream
 230c4bf add XSETID, XACKDEL and XDELEX stream commands
 36d809c add XAUTOCLAIM stream command
