@@ -34,6 +34,8 @@ fn read_request_inner<const REPLICATED: bool>(
         ReadOperation::XLen(param) => my_cache.execute_read(param, db_number, read_clock),
         ReadOperation::XRange(param) => my_cache.execute_read(param, db_number, read_clock),
         ReadOperation::XPending(param) => my_cache.execute_read(param, db_number, read_clock),
+        ReadOperation::XRevRange(param) => my_cache.execute_read(param, db_number, read_clock),
+        ReadOperation::XInfo(param) => my_cache.execute_read(param, db_number, read_clock),
         ReadOperation::ZRange(param) => my_cache.execute_read(param, db_number, read_clock),
         ReadOperation::HGet(param) => my_cache.execute_read(param, db_number, read_clock),
         ReadOperation::SMembers(param) => {

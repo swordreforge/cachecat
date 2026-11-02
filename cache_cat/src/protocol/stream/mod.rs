@@ -1,4 +1,5 @@
 use crate::error::ProtocolError;
+use crate::protocol::option_eq;
 use crate::raft::types::core::response_value::Value;
 use crate::raft::types::core::structure::stream::{IdRange, StreamId};
 use bytes::Bytes;
@@ -7,11 +8,13 @@ use std::ops::Bound;
 pub mod xack;
 pub mod xadd;
 pub mod xclaim;
+pub mod xinfo;
 pub mod xlen;
 pub mod xpending;
 pub mod xrange;
 pub mod xread;
 pub mod xreadgroup;
+pub mod xrevrange;
 
 pub mod xgroup;
 
@@ -66,6 +69,31 @@ pub(super) fn parse_interval(
         Bound::Unbounded => StreamId::MAX,
     };
     Ok((start, end))
+}
+
+/// Parse the optional `COUNT n` suffix shared by XRANGE and XREVRANGE.
+/// Redis keeps the last repeated COUNT, clamps a negative value to zero and
+/// rejects a non-integer. `None` means the option was not supplied.
+pub(super) fn parse_count_option(items: &[Value]) -> Result<Option<usize>, ProtocolError> {
+    let mut count = None;
+    let mut index = 0;
+    while index < items.len() {
+        let option = items[index]
+            .string_bytes_clone()
+            .ok_or(ProtocolError::SyntaxError)?;
+        if option_eq(&option, b"COUNT") && index + 1 < items.len() {
+            let value = items[index + 1].try_parse_canonical_i64()?;
+            count = Some(if value < 0 {
+                0
+            } else {
+                usize::try_from(value).map_err(|_| ProtocolError::NotAnInteger)?
+            });
+            index += 2;
+        } else {
+            return Err(ProtocolError::SyntaxError);
+        }
+    }
+    Ok(count)
 }
 
 // The NOGROUP replies live in the state-machine layer so the blocking

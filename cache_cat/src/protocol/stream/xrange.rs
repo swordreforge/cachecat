@@ -7,12 +7,12 @@
 //! limit hint; a negative count behaves like zero and replies with a null
 //! array, exactly like Redis.
 
+use super::parse_count_option;
 use super::parse_interval;
 use super::xread::entry_reply;
 use crate::error::{CacheCatError, ProtocolError};
 use crate::mocha::EntrySnapshot;
 use crate::protocol::command::{Client, Command};
-use crate::protocol::option_eq;
 use crate::protocol::raft_command::{RaftCommand, ReadRaftCommand};
 use crate::raft::network::redis_server::RedisServer;
 use crate::raft::types::core::mocha::core::MyValue;
@@ -48,37 +48,13 @@ impl XRangeParams {
             .string_bytes_clone()
             .ok_or(ProtocolError::InvalidArgument("key"))?;
         let (start, end) = parse_interval(&items[2], &items[3])?;
-        let count = Self::parse_options(&items[4..])?;
+        let count = parse_count_option(&items[4..])?;
         Ok(Self {
             key,
             start,
             end,
             count,
         })
-    }
-
-    /// Redis accepts repeated `COUNT` clauses and keeps the last one. A
-    /// negative count is clamped to zero; a non-integer is an error.
-    fn parse_options(items: &[Value]) -> Result<Option<usize>, ProtocolError> {
-        let mut count = None;
-        let mut index = 0;
-        while index < items.len() {
-            let option = items[index]
-                .string_bytes_clone()
-                .ok_or(ProtocolError::SyntaxError)?;
-            if option_eq(&option, b"COUNT") && index + 1 < items.len() {
-                let value = items[index + 1].try_parse_canonical_i64()?;
-                count = Some(if value < 0 {
-                    0
-                } else {
-                    usize::try_from(value).map_err(|_| ProtocolError::NotAnInteger)?
-                });
-                index += 2;
-            } else {
-                return Err(ProtocolError::SyntaxError);
-            }
-        }
-        Ok(count)
     }
 }
 

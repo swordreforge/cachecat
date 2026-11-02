@@ -1029,9 +1029,20 @@ impl RedisStream {
         }
     }
 
+    /// Current logical clock reading. Direct reads use it when no replicated
+    /// clock is supplied, so idle times stay consistent within one reply.
+    pub fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
+
     pub fn xinfo_consumers(&self, name: &[u8]) -> Result<Vec<ConsumerInfo>> {
+        self.xinfo_consumers_at(name, self.clock.now_ms())
+    }
+
+    /// Replicated variant: `now` is the logical clock captured for the read,
+    /// so every replica reports identical idle and inactive times.
+    pub fn xinfo_consumers_at(&self, name: &[u8], now: u64) -> Result<Vec<ConsumerInfo>> {
         let group = self.groups.get(name).ok_or(StreamError::NoGroup)?;
-        let now = self.clock.now_ms();
         let mut result: Vec<_> = group
             .consumers
             .iter()
@@ -1044,8 +1055,12 @@ impl RedisStream {
     /// `count` independently limits entries, group PELs and consumer PELs.
     /// None means unlimited. All groups/consumers are returned.
     pub fn xinfo_stream_full(&self, count: Option<usize>) -> FullStreamInfo {
+        self.xinfo_stream_full_at(count, self.clock.now_ms())
+    }
+
+    /// Replicated variant of `xinfo_stream_full`.
+    pub fn xinfo_stream_full_at(&self, count: Option<usize>, now: u64) -> FullStreamInfo {
         let limit = count.unwrap_or(usize::MAX);
-        let now = self.clock.now_ms();
         let mut groups: Vec<_> = self
             .groups
             .iter()

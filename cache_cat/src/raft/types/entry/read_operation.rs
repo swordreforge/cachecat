@@ -33,10 +33,12 @@ use crate::protocol::set::sismember::SIsMemberParams;
 use crate::protocol::set::smembers::SMembersParams;
 use crate::protocol::set::srandmember::SRandMemberParams;
 use crate::protocol::set::sunion::SUnionParams;
+use crate::protocol::stream::xinfo::XInfoParams;
 use crate::protocol::stream::xlen::XLenParams;
 use crate::protocol::stream::xpending::XPendingParams;
 use crate::protocol::stream::xrange::XRangeParams;
 use crate::protocol::stream::xread::XReadParams;
+use crate::protocol::stream::xrevrange::XRevRangeParams;
 use crate::protocol::string::get::GetParams;
 use crate::protocol::string::len::StrLenParams;
 use crate::protocol::string::mget::MgetParams;
@@ -47,8 +49,8 @@ use crate::protocol::zset::zrange::ZRangeParams;
 use crate::protocol::zset::zrangegetscore::ZRangeByScoreParams;
 use crate::protocol::zset::zrank::ZRankParams;
 use crate::protocol::zset::zrevrank::ZRevRankParams;
-use crate::protocol::zset::zscore::ZScoreParams;
 use crate::protocol::zset::zscan::ZScanParams;
+use crate::protocol::zset::zscore::ZScoreParams;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,4 +108,6 @@ pub enum ReadOperation {
     XLen(XLenParams),
     XRange(XRangeParams),
     XPending(XPendingParams),
+    XRevRange(XRevRangeParams),
+    XInfo(XInfoParams),
 }

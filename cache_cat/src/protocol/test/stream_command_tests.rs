@@ -337,3 +337,66 @@ fn xreadgroup_rejects_a_stale_group_generation() {
         Value::Array(None)
     ));
 }
+
+#[test]
+fn read_only_stream_metadata_commands_use_the_replicated_read_path() {
+    let cache = MyCache::new(2).unwrap();
+    seed_group(&cache);
+    apply(
+        &cache,
+        request(&["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"]),
+    );
+
+    // XREVRANGE keeps the wire order (end first) but returns descending IDs.
+    assert_eq!(
+        entry_ids(read(&cache, request(&["XREVRANGE", "s", "+", "-"]))),
+        [Bytes::from_static(b"2-0"), Bytes::from_static(b"1-0")]
+    );
+    assert!(matches!(
+        read(&cache, request(&["XREVRANGE", "missing", "+", "-"])),
+        Value::Array(Some(ref entries)) if entries.is_empty()
+    ));
+
+    let Value::Map(stream_info) = read(&cache, request(&["XINFO", "STREAM", "s"])) else {
+        panic!("expected an XINFO STREAM map");
+    };
+    assert!(
+        stream_info
+            .iter()
+            .any(
+                |(name, value)| name.string_bytes_clone().as_deref() == Some(b"length")
+                    && matches!(value, Value::Integer(2))
+            )
+    );
+
+    let Value::Array(Some(groups)) = read(&cache, request(&["XINFO", "GROUPS", "s"])) else {
+        panic!("expected an XINFO GROUPS array");
+    };
+    assert_eq!(groups.len(), 1);
+
+    let Value::Array(Some(consumers)) = read(&cache, request(&["XINFO", "CONSUMERS", "s", "g"]))
+    else {
+        panic!("expected an XINFO CONSUMERS array");
+    };
+    assert_eq!(consumers.len(), 1);
+
+    assert!(matches!(
+        read(&cache, request(&["XINFO", "CONSUMERS", "s", "nope"])),
+        Value::Error(ref message) if message.starts_with("NOGROUP")
+    ));
+    assert!(matches!(
+        read(&cache, request(&["XINFO", "HELP"])),
+        Value::Array(Some(ref lines)) if !lines.is_empty()
+    ));
+}
+
+#[test]
+fn xinfo_read_operations_roundtrip_through_bincode() {
+    let operation = request(&["XINFO", "STREAM", "s", "FULL", "COUNT", "2"]);
+    let encoded = bincode2::serialize(&Request::new(CLOCK, DB, operation)).unwrap();
+    let decoded: Request = bincode2::deserialize(&encoded).unwrap();
+    assert!(matches!(
+        decoded.operation,
+        Operation::Read(crate::raft::types::entry::read_operation::ReadOperation::XInfo(_))
+    ));
+}

@@ -98,11 +98,13 @@ use crate::protocol::stream::xack::XAckCommand;
 use crate::protocol::stream::xadd::XAddCommand;
 use crate::protocol::stream::xclaim::XClaimCommand;
 use crate::protocol::stream::xgroup::XGroupCommand;
+use crate::protocol::stream::xinfo::XInfoCommand;
 use crate::protocol::stream::xlen::XLenCommand;
 use crate::protocol::stream::xpending::XPendingCommand;
 use crate::protocol::stream::xrange::XRangeCommand;
 use crate::protocol::stream::xread::XReadCommand;
 use crate::protocol::stream::xreadgroup::XReadGroupCommand;
+use crate::protocol::stream::xrevrange::XRevRangeCommand;
 use crate::protocol::string::append::AppendCommand;
 use crate::protocol::string::decr::DecrCommand;
 use crate::protocol::string::decrby::DecrByCommand;
@@ -135,8 +137,8 @@ use crate::protocol::zset::zrangegetscore::ZRangeByScoreCommand;
 use crate::protocol::zset::zrank::ZRankCommand;
 use crate::protocol::zset::zrem::ZRemCommand;
 use crate::protocol::zset::zrevrank::ZRevRankCommand;
-use crate::protocol::zset::zscore::ZScoreCommand;
 use crate::protocol::zset::zscan::ZScanCommand;
+use crate::protocol::zset::zscore::ZScoreCommand;
 use crate::raft::network::connection::Connection;
 use crate::raft::network::redis_server::{RedisServer, RespCodec};
 use crate::raft::types::core::response_value::Value;
@@ -478,6 +480,8 @@ impl CommandFactory {
         factory.register("XREADGROUP", XReadGroupCommand);
         factory.register("XPENDING", XPendingCommand);
         factory.register("XCLAIM", XClaimCommand);
+        factory.register("XREVRANGE", XRevRangeCommand);
+        factory.register("XINFO", XInfoCommand);
         factory
     }
 

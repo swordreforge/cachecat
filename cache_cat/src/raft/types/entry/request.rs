@@ -117,6 +117,8 @@ impl fmt::Display for Request {
                 ReadOperation::XLen(req) => write!(f, "XLen: {}", req),
                 ReadOperation::XRange(req) => write!(f, "XRange: {}", req),
                 ReadOperation::XPending(req) => write!(f, "XPending: {}", req),
+                ReadOperation::XRevRange(req) => write!(f, "XRevRange: {}", req),
+                ReadOperation::XInfo(req) => write!(f, "XInfo: {}", req),
                 ReadOperation::ZRange(req) => write!(f, "ZRange: {}", req),
                 ReadOperation::Exists(req) => write!(f, "Exists: {}", req),
                 ReadOperation::LRange(req) => write!(f, "LRange: {}", req),
