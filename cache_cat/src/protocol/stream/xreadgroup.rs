@@ -363,15 +363,21 @@ impl XReadGroupParams {
     /// Read the group identity and generation of every key under the global
     /// writer. These are the tokens the replicated request carries, so a
     /// destroy+recreate can never redirect this request to the new group.
+    ///
+    /// Also reports whether the request has something to return immediately:
+    /// a history read always does, and a `>` read does when the group cursor is
+    /// behind the stream. When nothing is ready the caller can register a
+    /// waiter without spending a Raft write just to create/touch a consumer.
     fn capture(
         &self,
         cache: &MyCache,
         db: u16,
-    ) -> Result<(Vec<((u16, Bytes), Arc<()>)>, Vec<Option<u64>>), Value> {
+    ) -> Result<(Vec<((u16, Bytes), Arc<()>)>, Vec<Option<u64>>, bool), Value> {
         let database = cache.get_cache(db)?;
         let mut identities = Vec::with_capacity(self.request.keys.len());
         let mut generations = Vec::with_capacity(self.request.keys.len());
-        for key in &self.request.keys {
+        let mut immediate = false;
+        for (index, key) in self.request.keys.iter().enumerate() {
             let Some(entry) = database.mocha.get_entry(key) else {
                 return Err(no_group_read(key, &self.request.group));
             };
@@ -387,15 +393,20 @@ impl XReadGroupParams {
                 Ok(generation) => generation,
                 Err(_) => return Err(no_group_read(key, &self.request.group)),
             };
+            if matches!(self.request.modes[index], GroupRead::PendingAfter(_))
+                || stream.group_has_new(&self.request.group).unwrap_or(false)
+            {
+                immediate = true;
+            }
             identities.push(((db, key.clone()), identity));
             generations.push(Some(generation));
         }
-        Ok((identities, generations))
+        Ok((identities, generations, immediate))
     }
 
     async fn read(mut self, app: &CacheCatApp, db: u16) -> Result<Value, CacheCatError> {
         let cache = &app.state_machine.data.kvs;
-        let (identities, generations) = {
+        let (identities, generations, immediate) = {
             let _write = cache.write_lock.lock().await;
             let _read = cache.read_lock.read();
             match self.capture(cache, db) {
@@ -404,14 +415,20 @@ impl XReadGroupParams {
             }
         };
         self.request.expected_generations = generations;
-        let result = self.submit(app, db).await?;
         let Some(block_ms) = self.block_ms else {
-            return Ok(result);
+            return self.submit(app, db).await;
         };
-        // Redis only waits when at least one stream asks for `>` entries; an
-        // explicitly requested history is returned (possibly empty) at once.
-        if !matches!(result, Value::Array(None)) || !self.blocks_on_new() {
-            return Ok(result);
+        // Redis creates/touches the consumer before blocking, but that is a
+        // replicated write. When nothing is ready and every stream uses `>`,
+        // register the waiter first and submit only after an XADD wakes it.
+        // The consumer then appears on the first real read rather than while
+        // the client is idle.
+        let defer_initial_read = !immediate && self.blocks_on_new();
+        if !defer_initial_read {
+            let result = self.submit(app, db).await?;
+            if !matches!(result, Value::Array(None)) || !self.blocks_on_new() {
+                return Ok(result);
+            }
         }
         let deadline = (block_ms != 0).then(|| Instant::now() + Duration::from_millis(block_ms));
         loop {
