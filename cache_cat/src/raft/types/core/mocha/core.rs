@@ -67,9 +67,29 @@ pub struct MyCache {
 /// contains no additional mutex or atomic waiter count.
 #[derive(Debug)]
 pub struct WriteState {
-    pub blocking_keys: BlockingKeys<WriteState, (u16, Bytes), Value, XReadParams>,
+    pub blocking_keys: BlockingKeys<WriteState, (u16, Bytes), Value, StreamWaiter>,
     cleanup_receiver: Option<CleanupReceiver<WriteState>>,
 }
+
+/// What a blocked stream client is waiting for. A single registry serves both
+/// kinds, so every stream write can publish one generic "this key changed"
+/// event and each waiter decides whether the change is deliverable.
+#[derive(Debug, Clone)]
+pub enum StreamWaiter {
+    /// XREAD: the wake payload is the computed reply, delivered only when new
+    /// entries exist.
+    Read(XReadParams),
+    /// XREADGROUP: the payload is a readiness token and the client submits the
+    /// replicated group read itself. The group name and the identities captured
+    /// before waiting let the predicate distinguish new entries from a group
+    /// that was destroyed or recreated.
+    Group {
+        group: Bytes,
+        identities: Vec<((u16, Bytes), Arc<()>)>,
+    },
+}
+
+pub type StreamRegistration = Registration<WriteState, (u16, Bytes), Value, StreamWaiter>;
 
 impl WriteState {
     /// Stream registration uses the same guarded state. Starting the
@@ -82,13 +102,13 @@ impl WriteState {
         &mut self,
         keys: Vec<(u16, Bytes)>,
         deadline: Option<tokio::time::Instant>,
-        params: XReadParams,
-    ) -> Result<Registration<Self, (u16, Bytes), Value, XReadParams>, WaitError> {
+        waiter: StreamWaiter,
+    ) -> Result<StreamRegistration, WaitError> {
         if keys.is_empty() {
             return Err(WaitError::EmptyKeys);
         }
         self.prepare_registration()?;
-        self.blocking_keys.register_with(keys, deadline, params)
+        self.blocking_keys.register_with(keys, deadline, waiter)
     }
 }
 
@@ -266,13 +286,17 @@ impl MyCache {
 /// EXEC/Lua publish only their final state. Empty sets allocate no buckets.
 #[derive(Debug, Default)]
 pub struct ApplyEffects {
-    pub(crate) ready_streams: HashSet<(u16, Bytes)>,
+    /// Keys whose stream value changed during this apply batch. Appends, group
+    /// creation/destruction, cursor moves and PEL updates all land here; the
+    /// per-waiter predicate decides whether the change is deliverable, so no
+    /// command-specific wake-up bookkeeping is required.
+    pub(crate) changed_streams: HashSet<(u16, Bytes)>,
 }
 
 impl ApplyEffects {
     /// Reuse small tables without retaining a large transaction's buckets.
     /// Called only after a nonempty notification set has been processed.
-    pub(crate) fn recycle_ready_keys(keys: &mut HashSet<(u16, Bytes)>) {
+    pub(crate) fn recycle_changed_keys(keys: &mut HashSet<(u16, Bytes)>) {
         debug_assert!(keys.is_empty());
         if keys.capacity() > 64 {
             *keys = HashSet::new();

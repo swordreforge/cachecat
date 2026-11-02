@@ -37,15 +37,24 @@ pub(super) struct Group {
     pub(super) consumers: HashMap<Vec<u8>, Consumer>,
     /// Detect destroy/recreate while a SharedStream reader is sleeping.
     pub(super) identity: Arc<()>,
+    /// Replicated generation, assigned from `next_group_generation` on CREATE.
+    /// Unlike `identity` it survives snapshots and can be compared on every
+    /// replica, so a blocked XREADGROUP can reject a recreated group.
+    pub(super) generation: u64,
 }
 impl Group {
-    pub(super) fn new(last_delivered: StreamId, entries_read: Option<u64>) -> Self {
+    pub(super) fn new(
+        last_delivered: StreamId,
+        entries_read: Option<u64>,
+        generation: u64,
+    ) -> Self {
         Self {
             last_delivered,
             entries_read,
             pel: TreeMap::new(),
             consumers: HashMap::new(),
             identity: Arc::new(()),
+            generation,
         }
     }
 
@@ -189,6 +198,9 @@ pub struct RedisStream {
     pub(super) last_generated_id: StreamId,
     pub(super) entries_added: u64,
     pub(super) max_deleted_entry_id: StreamId,
+    /// Monotonic counter behind `Group::generation`. Replicated state, so it is
+    /// part of the stream snapshot.
+    pub(super) next_group_generation: u64,
     pub(super) clock: Arc<dyn Clock>,
 }
 
@@ -220,6 +232,7 @@ impl RedisStream {
             last_generated_id: StreamId::ZERO,
             entries_added: 0,
             max_deleted_entry_id: StreamId::ZERO,
+            next_group_generation: 0,
             clock,
         }
     }
@@ -549,7 +562,13 @@ impl RedisStream {
         }
         let id = self.resolve_group_start(start);
         let read = entries_read.map(|n| n.min(self.entries_added));
-        self.groups.insert(name.to_vec(), Group::new(id, read));
+        let generation = self
+            .next_group_generation
+            .checked_add(1)
+            .ok_or(StreamError::CounterOverflow)?;
+        self.next_group_generation = generation;
+        self.groups
+            .insert(name.to_vec(), Group::new(id, read, generation));
         Ok(())
     }
 
@@ -696,6 +715,16 @@ impl RedisStream {
             .get(name)
             .ok_or(StreamError::NoGroup)?
             .last_delivered)
+    }
+
+    /// Replicated generation of a consumer group. It changes on every CREATE,
+    /// so a blocked XREADGROUP can tell a recreated group from new entries.
+    pub fn group_generation(&self, name: &[u8]) -> Result<u64> {
+        Ok(self
+            .groups
+            .get(name)
+            .ok_or(StreamError::NoGroup)?
+            .generation)
     }
 
     /// Missing group is a zero acknowledgement count, not NOGROUP.
@@ -1065,6 +1094,9 @@ impl RedisStream {
             }
         }
         for group in self.groups.values() {
+            if group.generation == 0 || group.generation > self.next_group_generation {
+                return Err("group generation is outside the allocated range".into());
+            }
             for (key, pending) in group.pel.iter() {
                 let Some(c) = group.consumers.get(pending.consumer.as_slice()) else {
                     return Err("PEL owner is not a registered consumer".into());

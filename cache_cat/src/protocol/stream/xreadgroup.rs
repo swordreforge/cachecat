@@ -5,7 +5,7 @@
 //! local: a blocked client registers an ordinary stream waiter that wakes when
 //! XADD appends to one of the keys, then submits the real group read.
 
-use super::xread::{XReadId, XReadParams};
+use super::xread::XReadId;
 use super::{arg, no_group_read};
 use crate::error::{CacheCatError, Error, ProtocolError};
 use crate::mocha::{EntrySnapshot, MochaOperation};
@@ -15,7 +15,7 @@ use crate::protocol::raft_command::RaftCommand;
 use crate::raft::application::blocking_keys::WaitError;
 use crate::raft::network::redis_server::RedisServer;
 use crate::raft::types::core::mocha::cas::ComputeCommand;
-use crate::raft::types::core::mocha::core::{MyCache, MyValue, Update};
+use crate::raft::types::core::mocha::core::{MyCache, MyValue, StreamWaiter, Update};
 use crate::raft::types::core::response_value::{Resp2MapEncoding, Value};
 use crate::raft::types::core::structure::stream::{GroupEntry, GroupRead, ReadGroupOptions};
 use crate::raft::types::core::value_object::ValueObject;
@@ -25,7 +25,7 @@ use crate::raft::types::raft_types::CacheCatApp;
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::{fmt, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 use tokio::time::Instant;
 
 /// One replicated multi-key consumer-group read.
@@ -37,6 +37,10 @@ pub struct XReadGroupReq {
     pub modes: Vec<GroupRead>,
     pub count: Option<usize>,
     pub no_ack: bool,
+    /// Replicated group generations captured before a local wait. Empty for
+    /// EXEC/Lua and for the first attempt; a mismatch means the group was
+    /// destroyed and recreated while this request waited.
+    pub expected_generations: Vec<Option<u64>>,
 }
 
 impl fmt::Display for XReadGroupReq {
@@ -159,14 +163,23 @@ impl MyCache {
             Ok(database) => database,
             Err(error) => return error,
         };
-        for key in &request.keys {
+        for (index, key) in request.keys.iter().enumerate() {
             let Some(entry) = database.mocha.get_entry(key) else {
                 return no_group_read(key, &request.group);
             };
             let ValueObject::Stream(stream) = entry.value.data else {
                 return ProtocolError::WrongType.into();
             };
-            if !stream.read().has_group(&request.group) {
+            let stream = stream.read();
+            let generation = match stream.group_generation(&request.group) {
+                Ok(generation) => generation,
+                Err(_) => return no_group_read(key, &request.group),
+            };
+            // A waiter that captured a generation must never read a group that
+            // was destroyed and recreated in the meantime.
+            if let Some(Some(expected)) = request.expected_generations.get(index)
+                && *expected != generation
+            {
                 return no_group_read(key, &request.group);
             }
         }
@@ -177,6 +190,7 @@ impl MyCache {
             modes,
             count,
             no_ack,
+            ..
         } = request;
         let mut result = Vec::new();
         for (key, mode) in keys.into_iter().zip(modes) {
@@ -325,6 +339,7 @@ impl XReadGroupParams {
                 modes,
                 count,
                 no_ack,
+                expected_generations: Vec::new(),
             },
             block_ms,
         })
@@ -345,7 +360,50 @@ impl XReadGroupParams {
         .await
     }
 
-    async fn read(self, app: &CacheCatApp, db: u16) -> Result<Value, CacheCatError> {
+    /// Read the group identity and generation of every key under the global
+    /// writer. These are the tokens the replicated request carries, so a
+    /// destroy+recreate can never redirect this request to the new group.
+    fn capture(
+        &self,
+        cache: &MyCache,
+        db: u16,
+    ) -> Result<(Vec<((u16, Bytes), Arc<()>)>, Vec<Option<u64>>), Value> {
+        let database = cache.get_cache(db)?;
+        let mut identities = Vec::with_capacity(self.request.keys.len());
+        let mut generations = Vec::with_capacity(self.request.keys.len());
+        for key in &self.request.keys {
+            let Some(entry) = database.mocha.get_entry(key) else {
+                return Err(no_group_read(key, &self.request.group));
+            };
+            let ValueObject::Stream(stream) = entry.value.data else {
+                return Err(ProtocolError::WrongType.into());
+            };
+            let stream = stream.read();
+            let identity = match stream.group_identity(&self.request.group) {
+                Ok(identity) => identity,
+                Err(_) => return Err(no_group_read(key, &self.request.group)),
+            };
+            let generation = match stream.group_generation(&self.request.group) {
+                Ok(generation) => generation,
+                Err(_) => return Err(no_group_read(key, &self.request.group)),
+            };
+            identities.push(((db, key.clone()), identity));
+            generations.push(Some(generation));
+        }
+        Ok((identities, generations))
+    }
+
+    async fn read(mut self, app: &CacheCatApp, db: u16) -> Result<Value, CacheCatError> {
+        let cache = &app.state_machine.data.kvs;
+        let (identities, generations) = {
+            let _write = cache.write_lock.lock().await;
+            let _read = cache.read_lock.read();
+            match self.capture(cache, db) {
+                Ok(value) => value,
+                Err(error) => return Ok(error),
+            }
+        };
+        self.request.expected_generations = generations;
         let result = self.submit(app, db).await?;
         let Some(block_ms) = self.block_ms else {
             return Ok(result);
@@ -356,7 +414,6 @@ impl XReadGroupParams {
             return Ok(result);
         }
         let deadline = (block_ms != 0).then(|| Instant::now() + Duration::from_millis(block_ms));
-        let cache = &app.state_machine.data.kvs;
         loop {
             // Check readiness and register the waiter while holding the global
             // writer. Applying an XADD needs the same lock, so no wake-up can
@@ -364,7 +421,6 @@ impl XReadGroupParams {
             let registration = {
                 let mut write = cache.write_lock.lock().await;
                 let _read = cache.read_lock.read();
-                let clock = cache.get_and_update_read_clock();
                 let database = match cache.get_cache(db) {
                     Ok(database) => database,
                     Err(error) => return Ok(error),
@@ -372,20 +428,35 @@ impl XReadGroupParams {
                 let mut wait_keys = Vec::with_capacity(self.request.keys.len());
                 let mut ids = Vec::with_capacity(self.request.keys.len());
                 let mut ready = false;
-                for (key, mode) in self.request.keys.iter().zip(&self.request.modes) {
-                    let Some(entry) = database.mocha.get_with_read_clock(key, Some(clock)) else {
+                for ((key, mode), (_, expected)) in self
+                    .request
+                    .keys
+                    .iter()
+                    .zip(&self.request.modes)
+                    .zip(&identities)
+                {
+                    let Some(entry) = database.mocha.get_entry(key) else {
                         return Ok(no_group_read(key, &self.request.group));
                     };
                     let ValueObject::Stream(stream) = entry.value.data else {
                         return Ok(ProtocolError::WrongType.into());
                     };
                     let stream = stream.read();
-                    let last = match stream.group_last_delivered(&self.request.group) {
-                        Ok(last) => last,
+                    let current = match stream.group_identity(&self.request.group) {
+                        Ok(identity) => identity,
                         Err(_) => return Ok(no_group_read(key, &self.request.group)),
                     };
+                    // Destroyed or recreated between capture and registration:
+                    // fail now instead of waiting on a group we never saw.
+                    if !Arc::ptr_eq(expected, &current) {
+                        return Ok(no_group_read(key, &self.request.group));
+                    }
                     if matches!(mode, GroupRead::New) {
                         ready |= stream.group_has_new(&self.request.group).unwrap_or(false);
+                        let last = match stream.group_last_delivered(&self.request.group) {
+                            Ok(last) => last,
+                            Err(_) => return Ok(no_group_read(key, &self.request.group)),
+                        };
                         wait_keys.push((db, key.clone()));
                         ids.push(XReadId::After(last));
                     }
@@ -393,18 +464,16 @@ impl XReadGroupParams {
                 if ready {
                     None
                 } else {
-                    let params = XReadParams {
-                        keys: wait_keys.iter().map(|(_, key)| key.clone()).collect(),
-                        ids,
-                        count: self.request.count,
-                        max_count: None,
-                        max_size: None,
-                        block_ms: None,
-                        resp_version: 2,
-                    };
                     Some(
                         write
-                            .register_stream(wait_keys, deadline, params)
+                            .register_stream(
+                                wait_keys,
+                                deadline,
+                                StreamWaiter::Group {
+                                    group: self.request.group.clone(),
+                                    identities: identities.clone(),
+                                },
+                            )
                             .map_err(|error| {
                                 Error::internal(format!("cannot register XREADGROUP: {error:?}"))
                             })?,

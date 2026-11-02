@@ -1,11 +1,14 @@
 //! Stream commands must behave the same through the Raft read/write paths.
 
 use crate::protocol::raft_command::RaftCommandFactory;
+use crate::protocol::stream::xreadgroup::XReadGroupReq;
 use crate::raft::types::core::mocha::core::{MyCache, Update, UpdateType};
 use crate::raft::types::core::mocha::request_handler::{base_request, do_request, read_request};
 use crate::raft::types::core::response_value::Value;
+use crate::raft::types::core::structure::stream::GroupRead;
+use crate::raft::types::core::value_object::ValueObject;
 use crate::raft::types::entry::base_operation::BaseOperation;
-use crate::raft::types::entry::request::{AtomicRequest, Operation, Request};
+use crate::raft::types::entry::request::{AtomicRequest, Operation, RedisOperation, Request};
 use bytes::Bytes;
 
 const DB: u16 = 1;
@@ -277,5 +280,60 @@ fn xreadgroup_assigns_pending_and_replays_deterministically() {
             request(&["XREADGROUP", "GROUP", "nope", "c", "STREAMS", "s", ">"])
         ),
         Value::Error(ref message) if message.starts_with("NOGROUP")
+    ));
+}
+
+fn group_generation(cache: &MyCache) -> u64 {
+    let entry = cache.databases[DB as usize]
+        .mocha
+        .get_entry(b"s".as_slice())
+        .expect("stream exists");
+    let ValueObject::Stream(stream) = &entry.value.data else {
+        panic!("expected a stream");
+    };
+    stream.read().group_generation(b"g").expect("group exists")
+}
+
+fn group_request(expected: u64, consumer: &str) -> Operation {
+    Operation::Redis(RedisOperation::RedisXReadGroup(XReadGroupReq {
+        keys: vec![Bytes::from_static(b"s")],
+        group: Bytes::from_static(b"g"),
+        consumer: Bytes::copy_from_slice(consumer.as_bytes()),
+        modes: vec![GroupRead::New],
+        count: None,
+        no_ack: false,
+        expected_generations: vec![Some(expected)],
+    }))
+}
+
+#[test]
+fn xreadgroup_rejects_a_stale_group_generation() {
+    let cache = MyCache::new(2).unwrap();
+    seed_group(&cache);
+    let generation = group_generation(&cache);
+
+    // A waiter that captured the group before a recreate must not silently
+    // start reading the replacement group.
+    assert!(matches!(
+        apply(&cache, group_request(generation + 1, "stale")),
+        Value::Error(ref message) if message.starts_with("NOGROUP")
+    ));
+
+    // Destroy + recreate allocates a new generation.
+    apply(&cache, request(&["XGROUP", "DESTROY", "s", "g"]));
+    apply(&cache, request(&["XGROUP", "CREATE", "s", "g", "0"]));
+    let recreated = group_generation(&cache);
+    assert!(recreated > generation);
+    assert!(matches!(
+        apply(&cache, group_request(generation, "stale")),
+        Value::Error(ref message) if message.starts_with("NOGROUP")
+    ));
+
+    // The current generation still delivers normally.
+    let reply = apply(&cache, group_request(recreated, "fresh"));
+    assert!(matches!(reply, Value::MapWithResp2 { .. }));
+    assert!(matches!(
+        apply(&cache, group_request(recreated, "fresh")),
+        Value::Array(None)
     ));
 }

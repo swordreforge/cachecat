@@ -1,9 +1,14 @@
-use crate::raft::types::core::mocha::core::{ApplyEffects, MyCache, Update, UpdateType};
+use crate::raft::types::core::mocha::core::{
+    ApplyEffects, MyCache, StreamWaiter, Update, UpdateType,
+};
 use crate::raft::types::core::response_value::Value;
 use crate::raft::types::core::structure::stream::AddId;
+use crate::raft::types::core::value_object::ValueObject;
 use crate::raft::types::entry::base_operation::BaseOperation;
 use crate::raft::types::entry::read_operation::ReadOperation;
 use crate::raft::types::entry::request::{Operation, RedisOperation};
+use bytes::Bytes;
+use std::sync::Arc;
 
 pub fn read_request(
     my_cache: &MyCache,
@@ -138,23 +143,7 @@ fn base_request_inner(
             if matches!(param.id, AddId::Auto) {
                 param.id = AddId::AutoSequence(update.write_clock);
             }
-            let key = (update.effects.is_some()
-                && !matches!(update.update_type, UpdateType::CAS { .. })
-                && update
-                    .waiters
-                    .as_deref()
-                    .is_some_and(|waiters| !waiters.blocking_keys.is_empty()))
-            .then(|| (update.db_number, param.key.clone()));
-            let result = my_cache.execute_compute(param, update);
-            if matches!(&result, Value::BulkString(Some(_)))
-                && let Some(key) = key
-                && let Some(effects) = update.effects.as_deref_mut()
-            {
-                // EXEC and Lua must finish before their final stream contents
-                // are served to readers; intermediate XADD data can be deleted.
-                effects.ready_streams.insert(key);
-            }
-            result
+            my_cache.execute_compute(param, update)
         }
         BaseOperation::Expire(param) => my_cache.expire(param, update),
         BaseOperation::PExpire(param) => my_cache.p_expire(param, update),
@@ -302,23 +291,68 @@ pub fn do_request(
         // The state machine owns this context under its existing write_lock.
         // Empty sets require no registry access, atomics, allocation or locks;
         // drain retains capacity for later commands in the same apply batch.
-        if !effects.ready_streams.is_empty() {
+        if !effects.changed_streams.is_empty() {
             // Capture owned responses before a following DEL can erase data.
             let waiters = update
                 .waiters
                 .as_deref_mut()
                 .expect("effects require an execution guard");
-            for key in effects.ready_streams.drain() {
-                waiters.blocking_keys.wake_ready(&key, |params| {
-                    let result =
-                        my_cache.execute_multi_read(params.clone(), key.0, update.write_clock);
-                    (!matches!(result, Value::Array(None))).then_some(result)
-                });
+            for key in effects.changed_streams.drain() {
+                waiters
+                    .blocking_keys
+                    .wake_ready(&key, |waiter| match waiter {
+                        StreamWaiter::Read(params) => {
+                            let result = my_cache.execute_multi_read(
+                                params.clone(),
+                                key.0,
+                                update.write_clock,
+                            );
+                            (!matches!(result, Value::Array(None))).then_some(result)
+                        }
+                        // The payload is only a token: the client submits the
+                        // authoritative group read, which also validates the
+                        // replicated generation captured before waiting.
+                        StreamWaiter::Group { group, identities } => {
+                            group_waiter_ready(my_cache, &key, group, identities)
+                                .then_some(Value::ok())
+                        }
+                    });
             }
-            ApplyEffects::recycle_ready_keys(&mut effects.ready_streams);
+            ApplyEffects::recycle_changed_keys(&mut effects.changed_streams);
         }
     }
     result
+}
+
+/// Decide whether a stream change matters to a blocked XREADGROUP. New entries
+/// wake it, and so do a destroyed or recreated group: the pending submit then
+/// fails with NOGROUP instead of silently reading the new group.
+fn group_waiter_ready(
+    my_cache: &MyCache,
+    key: &(u16, Bytes),
+    group: &Bytes,
+    identities: &[((u16, Bytes), Arc<()>)],
+) -> bool {
+    let Some(database) = my_cache.databases.get(key.0 as usize) else {
+        return false;
+    };
+    let Some(entry) = database.mocha.get_entry(&key.1) else {
+        return true;
+    };
+    let ValueObject::Stream(stream) = &entry.value.data else {
+        return true;
+    };
+    let stream = stream.read();
+    let Ok(current) = stream.group_identity(group) else {
+        return true;
+    };
+    let Some((_, expected)) = identities.iter().find(|(waited, _)| waited == key) else {
+        return true;
+    };
+    if !Arc::ptr_eq(expected, &current) {
+        return true;
+    }
+    stream.group_has_new(group).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -472,19 +506,31 @@ mod tests {
             .write_lock
             .lock()
             .await
-            .register_stream(vec![(0, key.clone())], None, read_params(&key))
+            .register_stream(
+                vec![(0, key.clone())],
+                None,
+                StreamWaiter::Read(read_params(&key)),
+            )
             .unwrap();
         let second = cache
             .write_lock
             .lock()
             .await
-            .register_stream(vec![(0, key.clone())], None, read_params(&key))
+            .register_stream(
+                vec![(0, key.clone())],
+                None,
+                StreamWaiter::Read(read_params(&key)),
+            )
             .unwrap();
         let mut other_db = cache
             .write_lock
             .lock()
             .await
-            .register_stream(vec![(1, key.clone())], None, read_params(&key))
+            .register_stream(
+                vec![(1, key.clone())],
+                None,
+                StreamWaiter::Read(read_params(&key)),
+            )
             .unwrap();
 
         let result = apply(&cache, xadd(&key, AddId::Auto), 0, 1234).await;
@@ -522,7 +568,11 @@ mod tests {
             .write_lock
             .lock()
             .await
-            .register_stream(vec![(0, key.clone())], None, read_params(&key))
+            .register_stream(
+                vec![(0, key.clone())],
+                None,
+                StreamWaiter::Read(read_params(&key)),
+            )
             .unwrap();
         assert!(matches!(
             apply(&cache, xadd(&key, id), 0, 10).await,
@@ -542,7 +592,11 @@ mod tests {
             .write_lock
             .lock()
             .await
-            .register_stream(vec![(0, key.clone())], None, read_params(&key))
+            .register_stream(
+                vec![(0, key.clone())],
+                None,
+                StreamWaiter::Read(read_params(&key)),
+            )
             .unwrap();
         assert!(matches!(
             apply(&cache, xadd(&key, AddId::Auto), 0, 11).await,
@@ -585,7 +639,7 @@ mod tests {
                 .write_lock
                 .lock()
                 .await
-                .register_stream(vec![(0, key.clone())], None, params)
+                .register_stream(vec![(0, key.clone())], None, StreamWaiter::Read(params))
                 .unwrap();
             let result = apply(&cache, operation, db_number, 1234).await;
             assert!(!matches!(result, Value::Error(_)), "{result:?}");
@@ -607,7 +661,11 @@ mod tests {
             .write_lock
             .lock()
             .await
-            .register_stream(vec![(0, key.clone())], None, read_params(&key))
+            .register_stream(
+                vec![(0, key.clone())],
+                None,
+                StreamWaiter::Read(read_params(&key)),
+            )
             .unwrap();
 
         apply(&cache, xadd(&key, AddId::Auto), 0, 1234).await;
@@ -638,7 +696,7 @@ mod tests {
             .write_lock
             .lock()
             .await
-            .register_stream(vec![(0, key.clone())], None, params)
+            .register_stream(vec![(0, key.clone())], None, StreamWaiter::Read(params))
             .unwrap();
 
         apply(&cache, xadd(&key, AddId::Auto), 0, 1234).await;
@@ -678,7 +736,11 @@ mod tests {
                 .write_lock
                 .lock()
                 .await
-                .register_stream(vec![(0, key.clone())], None, read_params(&key))
+                .register_stream(
+                    vec![(0, key.clone())],
+                    None,
+                    StreamWaiter::Read(read_params(&key)),
+                )
                 .unwrap();
             let result = apply(&cache, operation, 0, 1234).await;
             assert!(!matches!(result, Value::Error(_)), "{result:?}");
@@ -714,7 +776,11 @@ mod tests {
                     .write_lock
                     .lock()
                     .await
-                    .register_stream(vec![(db, stream.clone())], None, read_params(&stream))
+                    .register_stream(
+                        vec![(db, stream.clone())],
+                        None,
+                        StreamWaiter::Read(read_params(&stream)),
+                    )
                     .unwrap(),
             );
         }
@@ -733,7 +799,7 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Value::Array(Some(_))));
-        assert!(effects.ready_streams.is_empty());
+        assert!(effects.changed_streams.is_empty());
         for (db, reader) in readers.into_iter().enumerate() {
             let (ready_key, reply) = reader.wait().now_or_never().unwrap().unwrap();
             assert_eq!(ready_key, (db as u16, stream.clone()));
@@ -753,7 +819,11 @@ mod tests {
             .write_lock
             .lock()
             .await
-            .register_stream(vec![(0, stream.clone())], None, read_params(&stream))
+            .register_stream(
+                vec![(0, stream.clone())],
+                None,
+                StreamWaiter::Read(read_params(&stream)),
+            )
             .unwrap();
         let mut effects = ApplyEffects::default();
         let result = apply_with_effects(
@@ -775,7 +845,7 @@ mod tests {
         assert!(matches!(result, Value::Error(_)));
         let (_, response) = reader.wait().now_or_never().unwrap().unwrap();
         assert_eq!(response.encode(), expected_reply("1234-0"));
-        assert!(effects.ready_streams.is_empty());
+        assert!(effects.changed_streams.is_empty());
     }
 
     #[tokio::test]
@@ -787,7 +857,11 @@ mod tests {
             .write_lock
             .lock()
             .await
-            .register_stream(vec![(0, stream.clone())], None, read_params(&stream))
+            .register_stream(
+                vec![(0, stream.clone())],
+                None,
+                StreamWaiter::Read(read_params(&stream)),
+            )
             .unwrap();
         let mut effects = ApplyEffects::default();
         apply_inner_with_effects(
@@ -799,7 +873,7 @@ mod tests {
             false,
         )
         .await;
-        let capacity = effects.ready_streams.capacity();
+        let capacity = effects.changed_streams.capacity();
         assert!(capacity > 0);
         assert!(reader.cancel().await);
         apply_with_effects(
@@ -810,8 +884,8 @@ mod tests {
             &mut effects,
         )
         .await;
-        assert!(effects.ready_streams.is_empty());
-        assert_eq!(effects.ready_streams.capacity(), capacity);
+        assert!(effects.changed_streams.is_empty());
+        assert_eq!(effects.changed_streams.capacity(), capacity);
 
         // Register directly so stale effects would produce an observable
         // response from the stream; an unrelated SET must not serve it.
@@ -819,7 +893,11 @@ mod tests {
             .write_lock
             .lock()
             .await
-            .register_stream(vec![(0, stream.clone())], None, read_params(&stream))
+            .register_stream(
+                vec![(0, stream.clone())],
+                None,
+                StreamWaiter::Read(read_params(&stream)),
+            )
             .unwrap();
         apply_with_effects(
             &cache,
@@ -834,7 +912,7 @@ mod tests {
         )
         .await;
         assert!(later_reader.cancel().await);
-        assert_eq!(effects.ready_streams.capacity(), capacity);
+        assert_eq!(effects.changed_streams.capacity(), capacity);
     }
 
     #[tokio::test]
@@ -845,7 +923,11 @@ mod tests {
             .write_lock
             .lock()
             .await
-            .register_stream(vec![(0, stream.clone())], None, read_params(&stream))
+            .register_stream(
+                vec![(0, stream.clone())],
+                None,
+                StreamWaiter::Read(read_params(&stream)),
+            )
             .unwrap();
         let mut update_type = UpdateType::CAS {
             expected_revision: crate::utils::OptionalU64::NONE,
@@ -876,8 +958,8 @@ mod tests {
         )
         .await;
         assert!(reader.cancel().await);
-        assert!(effects.ready_streams.is_empty());
-        assert_eq!(effects.ready_streams.capacity(), 0);
+        assert!(effects.changed_streams.is_empty());
+        assert_eq!(effects.changed_streams.capacity(), 0);
     }
 
     #[tokio::test]
@@ -897,7 +979,7 @@ mod tests {
             .register_stream(
                 keys.iter().map(|key| (0, key.clone())).collect(),
                 None,
-                params,
+                StreamWaiter::Read(params),
             )
             .unwrap();
         let mut effects = ApplyEffects::default();
@@ -915,8 +997,8 @@ mod tests {
         assert!(
             matches!(reply, Value::MapWithResp2 { entries, .. } if entries.len() == keys.len())
         );
-        assert!(effects.ready_streams.is_empty());
-        assert_eq!(effects.ready_streams.capacity(), 0);
+        assert!(effects.changed_streams.is_empty());
+        assert_eq!(effects.changed_streams.capacity(), 0);
 
         let mut params = read_params(&keys[0]);
         params.ids[0] = XReadId::After(StreamId::new(1, 0));
@@ -924,11 +1006,173 @@ mod tests {
             .write_lock
             .lock()
             .await
-            .register_stream(vec![(0, keys[0].clone())], None, params)
+            .register_stream(vec![(0, keys[0].clone())], None, StreamWaiter::Read(params))
             .unwrap();
         apply_with_effects(&cache, xadd(&keys[0], AddId::Auto), 0, 2, &mut effects).await;
         assert!(next.wait().now_or_never().unwrap().is_ok());
-        assert!(effects.ready_streams.capacity() > 0);
-        assert!(effects.ready_streams.capacity() <= 64);
+        assert!(effects.changed_streams.capacity() > 0);
+        assert!(effects.changed_streams.capacity() <= 64);
+    }
+
+    async fn seed_group_at_tail(cache: &MyCache, key: &Bytes) {
+        apply(cache, xadd(key, AddId::Auto), 0, 1).await;
+        apply(
+            cache,
+            Operation::Base(BaseOperation::XGroup(
+                crate::protocol::stream::xgroup::XGroupReq::Create {
+                    key: key.clone(),
+                    group: Bytes::from_static(b"g"),
+                    id: crate::raft::types::core::structure::stream::GroupStart::Last,
+                    entries_read: None,
+                    mkstream: false,
+                },
+            )),
+            0,
+            2,
+        )
+        .await;
+    }
+
+    fn group_identities(
+        cache: &MyCache,
+        key: &Bytes,
+        group: &'static [u8],
+    ) -> Vec<((u16, Bytes), Arc<()>)> {
+        let entry = cache.databases[0].mocha.get_entry(key).unwrap();
+        let ValueObject::Stream(stream) = &entry.value.data else {
+            panic!("expected a stream");
+        };
+        vec![(
+            (0, key.clone()),
+            stream.read().group_identity(group).unwrap(),
+        )]
+    }
+
+    #[tokio::test]
+    async fn pel_only_changes_do_not_wake_group_waiters() {
+        use futures::FutureExt;
+
+        let cache = MyCache::new(2).unwrap();
+        let key = Bytes::from_static(b"stream");
+        seed_group_at_tail(&cache, &key).await;
+        let group = Bytes::from_static(b"g");
+        let identities = group_identities(&cache, &key, b"g");
+        assert!(!group_waiter_ready(
+            &cache,
+            &(0, key.clone()),
+            &group,
+            &identities
+        ));
+
+        let waiter = cache
+            .write_lock
+            .lock()
+            .await
+            .register_stream(
+                vec![(0, key.clone())],
+                None,
+                StreamWaiter::Group {
+                    group: group.clone(),
+                    identities: identities.clone(),
+                },
+            )
+            .unwrap();
+
+        // XCLAIM FORCE records a PEL entry but adds no deliverable entries.
+        let mut effects = ApplyEffects::default();
+        apply_with_effects(
+            &cache,
+            Operation::Base(BaseOperation::XClaim(
+                crate::protocol::stream::xclaim::XClaimReq {
+                    key: key.clone(),
+                    group: group.clone(),
+                    consumer: Bytes::from_static(b"c"),
+                    ids: vec![StreamId::new(1, 0)],
+                    options: crate::raft::types::core::structure::stream::ClaimOptions {
+                        force: true,
+                        ..Default::default()
+                    },
+                },
+            )),
+            0,
+            3,
+            &mut effects,
+        )
+        .await;
+        // The event is drained by the dispatcher; what matters is that the
+        // predicate refuses it and the waiter stays registered.
+        assert!(
+            waiter.wait().now_or_never().is_none(),
+            "a PEL-only change must not wake a blocked group read"
+        );
+    }
+
+    #[tokio::test]
+    async fn xgroup_destroy_wakes_group_waiters_with_a_token() {
+        use futures::FutureExt;
+
+        let cache = MyCache::new(2).unwrap();
+        let key = Bytes::from_static(b"stream");
+        seed_group_at_tail(&cache, &key).await;
+        let group = Bytes::from_static(b"g");
+        let identities = group_identities(&cache, &key, b"g");
+
+        let waiter = cache
+            .write_lock
+            .lock()
+            .await
+            .register_stream(
+                vec![(0, key.clone())],
+                None,
+                StreamWaiter::Group {
+                    group: group.clone(),
+                    identities: identities.clone(),
+                },
+            )
+            .unwrap();
+
+        let mut effects = ApplyEffects::default();
+        apply_with_effects(
+            &cache,
+            Operation::Base(BaseOperation::XGroup(
+                crate::protocol::stream::xgroup::XGroupReq::Destroy {
+                    key: key.clone(),
+                    group: group.clone(),
+                },
+            )),
+            0,
+            3,
+            &mut effects,
+        )
+        .await;
+        let (_, token) = waiter
+            .wait()
+            .now_or_never()
+            .expect("DESTROY must wake the blocked group read")
+            .unwrap();
+        assert!(matches!(token, Value::SimpleString(_)));
+
+        // A recreated group has a new generation and a new identity.
+        apply(
+            &cache,
+            Operation::Base(BaseOperation::XGroup(
+                crate::protocol::stream::xgroup::XGroupReq::Create {
+                    key: key.clone(),
+                    group: group.clone(),
+                    id: crate::raft::types::core::structure::stream::GroupStart::Last,
+                    entries_read: None,
+                    mkstream: false,
+                },
+            )),
+            0,
+            4,
+        )
+        .await;
+        assert!(group_waiter_ready(
+            &cache,
+            &(0, key.clone()),
+            &group,
+            &identities
+        ));
     }
 }

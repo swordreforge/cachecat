@@ -12,7 +12,7 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{collections::HashMap, fmt, sync::Arc};
 
-pub const SNAPSHOT_VERSION: u32 = 3;
+pub const SNAPSHOT_VERSION: u32 = 4;
 
 /// Owned, versioned logical snapshot. No runtime locks, notifications, identity
 /// pointers, or clock implementations are persisted. Binary names remain bytes.
@@ -29,6 +29,9 @@ pub struct StreamSnapshot {
     pub max_deleted_entry_id: StreamId,
     pub entries: Vec<Entry>,
     pub groups: Vec<GroupSnapshot>,
+    /// High watermark of `Group::generation`; restored before groups so a
+    /// recreated group can never reuse a previously allocated generation.
+    pub next_group_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +43,8 @@ pub struct GroupSnapshot {
     pub consumers: Vec<ConsumerSnapshot>,
     /// The authoritative group PEL. Consumer PEL indexes are rebuilt from here.
     pub pending: Vec<PendingSnapshot>,
+    /// Replicated create generation; 0 is invalid.
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +105,7 @@ impl StreamSnapshot {
         stream.last_generated_id = self.last_generated_id;
         stream.entries_added = self.entries_added;
         stream.max_deleted_entry_id = self.max_deleted_entry_id;
+        stream.next_group_generation = self.next_group_generation;
 
         let mut previous = StreamId::ZERO;
         for entry in self.entries {
@@ -120,9 +126,14 @@ impl StreamSnapshot {
             if stream.groups.contains_key(saved.name.as_slice()) {
                 return Err(SnapshotError("duplicate consumer group name".into()));
             }
+            if saved.generation == 0 || saved.generation > stream.next_group_generation {
+                return Err(SnapshotError(
+                    "group generation is outside the allocated range".into(),
+                ));
+            }
             // Cursor and entries_read can exceed stream metadata after legal
             // administrative SETID operations. Do not clamp or recompute them.
-            let mut group = Group::new(saved.last_delivered, saved.entries_read);
+            let mut group = Group::new(saved.last_delivered, saved.entries_read, saved.generation);
             for consumer in saved.consumers {
                 if group.consumers.contains_key(consumer.name.as_slice()) {
                     return Err(SnapshotError("duplicate consumer name".into()));
@@ -201,6 +212,7 @@ impl RedisStream {
                             deliveries: p.deliveries,
                         })
                         .collect(),
+                    generation: g.generation,
                 }
             })
             .collect();
@@ -219,6 +231,7 @@ impl RedisStream {
                 })
                 .collect(),
             groups,
+            next_group_generation: self.next_group_generation,
         }
     }
 }
@@ -290,6 +303,7 @@ struct GroupRef<'a> {
     entries_read: Option<u64>,
     consumers: ConsumersRef<'a>,
     pending: PendingListRef<'a>,
+    generation: u64,
 }
 struct GroupsRef<'a>(&'a HashMap<Vec<u8>, Group>);
 impl Serialize for GroupsRef<'_> {
@@ -302,19 +316,21 @@ impl Serialize for GroupsRef<'_> {
             entries_read: g.entries_read,
             consumers: ConsumersRef(&g.consumers),
             pending: PendingListRef(&g.pel),
+            generation: g.generation,
         }))
     }
 }
 
 impl Serialize for RedisStream {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("StreamSnapshot", 6)?;
+        let mut state = serializer.serialize_struct("StreamSnapshot", 7)?;
         state.serialize_field("version", &SNAPSHOT_VERSION)?;
         state.serialize_field("last_generated_id", &self.last_generated_id)?;
         state.serialize_field("entries_added", &self.entries_added)?;
         state.serialize_field("max_deleted_entry_id", &self.max_deleted_entry_id)?;
         state.serialize_field("entries", &EntriesRef(&self.entries))?;
         state.serialize_field("groups", &GroupsRef(&self.groups))?;
+        state.serialize_field("next_group_generation", &self.next_group_generation)?;
         state.end()
     }
 }
@@ -324,5 +340,54 @@ impl<'de> Deserialize<'de> for RedisStream {
         StreamSnapshot::deserialize(deserializer)?
             .into_stream()
             .map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raft::types::core::structure::stream::{AddId, GroupStart};
+
+    fn seeded() -> RedisStream {
+        let mut stream = RedisStream::new();
+        stream
+            .xadd(
+                AddId::Explicit(StreamId::new(1, 0)),
+                vec![(b"field".to_vec(), b"value".to_vec())],
+            )
+            .unwrap();
+        stream
+            .xgroup_create(b"g1", GroupStart::Id(StreamId::ZERO), None)
+            .unwrap();
+        stream.xgroup_create(b"g2", GroupStart::Last, None).unwrap();
+        stream
+    }
+
+    #[test]
+    fn group_generations_survive_a_snapshot_round_trip() {
+        let stream = seeded();
+        assert_eq!(stream.group_generation(b"g1").unwrap(), 1);
+        assert_eq!(stream.group_generation(b"g2").unwrap(), 2);
+        let mut restored = stream.snapshot().into_stream().unwrap();
+        assert_eq!(restored.group_generation(b"g1").unwrap(), 1);
+        assert_eq!(restored.group_generation(b"g2").unwrap(), 2);
+        // The restored counter keeps allocating, so a recreated group can never
+        // reuse a generation that a snapshot already handed out.
+        restored
+            .xgroup_create(b"g3", GroupStart::Last, None)
+            .unwrap();
+        assert_eq!(restored.group_generation(b"g3").unwrap(), 3);
+    }
+
+    #[test]
+    fn restore_rejects_generations_outside_the_allocated_range() {
+        let snapshot = seeded().snapshot();
+        let mut zero = snapshot.clone();
+        zero.groups[0].generation = 0;
+        assert!(zero.into_stream().is_err());
+
+        let mut ahead = snapshot;
+        ahead.groups[0].generation = ahead.next_group_generation + 1;
+        assert!(ahead.into_stream().is_err());
     }
 }

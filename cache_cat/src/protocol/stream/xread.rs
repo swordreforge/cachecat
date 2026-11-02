@@ -5,9 +5,9 @@ use crate::mocha::EntrySnapshot;
 use crate::protocol::command::{Client, Command};
 use crate::protocol::common::blocking::buffer_until_disconnect;
 use crate::protocol::raft_command::ReadRaftCommand;
-use crate::raft::application::blocking_keys::{Registration, WaitError};
+use crate::raft::application::blocking_keys::WaitError;
 use crate::raft::network::redis_server::RedisServer;
-use crate::raft::types::core::mocha::core::{MyCache, MyValue, WriteState};
+use crate::raft::types::core::mocha::core::{MyCache, MyValue, StreamRegistration, StreamWaiter};
 use crate::raft::types::core::mocha::read_command::MultiReadCommand;
 use crate::raft::types::core::response_value::{Resp2MapEncoding, Value};
 use crate::raft::types::core::structure::stream::{Entry, Fields, ReadStart, StreamId};
@@ -298,7 +298,7 @@ impl XReadParams {
     {
         enum InitialRead {
             Ready(Value),
-            Waiting(Registration<WriteState, (u16, Bytes), Value, XReadParams>),
+            Waiting(StreamRegistration),
         }
 
         let deadline = match self.block_ms {
@@ -330,7 +330,7 @@ impl XReadParams {
                 // The writer subsequently builds the response before allowing
                 // another command to delete or change the stream.
                 write_lock
-                    .register_stream(keys, deadline, self)
+                    .register_stream(keys, deadline, StreamWaiter::Read(self))
                     .map_err(|error| Error::internal(format!("cannot register XREAD: {error:?}")))?
             };
             Ok::<_, CacheCatError>(InitialRead::Waiting(registration))

@@ -5,6 +5,7 @@ use crate::raft::types::core::mocha::core::{
 };
 use crate::raft::types::core::mocha::request_handler::base_request;
 use crate::raft::types::core::response_value::Value;
+use crate::raft::types::core::value_object::ValueObject;
 use crate::raft::types::entry::base_operation::{BaseOperation, InsertReq};
 use crate::raft::types::entry::request::AtomicRequest;
 use crate::utils::OptionalU64;
@@ -163,6 +164,19 @@ impl MyCache {
             UpdateType::Snapshot { revision, .. } => next_snapshot_revision(revision),
             UpdateType::CAS { revision, .. } => *revision,
         };
+        // One generic event covers every stream write: XADD, XGROUP, XACK,
+        // XCLAIM and XREADGROUP all rewrite a stream value. Waiters re-evaluate
+        // on wake, so no command has to remember to publish its own event.
+        let notify_key = (matches!(
+            &changed,
+            MochaOperation::Insert { value, .. }
+                if matches!(&value.data, ValueObject::Stream(_))
+        ) && !matches!(update.update_type, UpdateType::CAS { .. })
+            && update
+                .waiters
+                .as_deref()
+                .is_some_and(|waiters| !waiters.blocking_keys.is_empty()))
+        .then(|| (update.db_number, key.clone()));
         match changed {
             MochaOperation::Insert { mut value, expire } => {
                 value.version = revision;
@@ -183,6 +197,9 @@ impl MyCache {
                 write_clock: update.write_clock,
                 db_number: update.db_number,
             });
+        }
+        if let (Some(key), Some(effects)) = (notify_key, update.effects.as_deref_mut()) {
+            effects.changed_streams.insert(key);
         }
         response
     }
