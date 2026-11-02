@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 const CACHE_MAGIC_NUM: &[u8; 4] = b"MCDC";
 
-pub(crate) const VERSION: u8 = 1;
+pub(crate) const VERSION: u8 = 2;
 
 // Magic, version, and two big-endian u64s locating the metadata at EOF.
 const HEADER_LENGTH: u64 = 4 + 1 + 8 + 8;
