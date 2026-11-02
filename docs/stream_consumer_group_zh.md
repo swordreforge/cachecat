@@ -15,9 +15,9 @@
 1. 补齐 `XLEN`、`XRANGE`、`XACK`、`XREADGROUP`、`XPENDING`、`XCLAIM` 六个命令；
 2. 把阻塞唤醒从"只有追加才有事件"重构成"任意 stream 写入产生通用变更事件 + 等待者自检"。
 
-之后又完成了三批增量：第一批补齐只读的 `XREVRANGE` 与 `XINFO`（见 2.2），
+之后又完成了四批增量：第一批补齐只读的 `XREVRANGE` 与 `XINFO`（见 2.2），
 第二批补齐删除/裁剪的 `XDEL` 与 `XTRIM`（见 2.3），第三批补齐自动认领的
-`XAUTOCLAIM`（见 2.4）。
+`XAUTOCLAIM`（见 2.4），第四批补齐 `XSETID`、`XACKDEL` 与 `XDELEX`（见 2.5）。
 
 ## 2. 新增命令
 
@@ -34,10 +34,14 @@
 | `XDEL` | `ComputeCommand` | `BaseOperation::XDel` | 单键读改写，删除条目 |
 | `XTRIM` | `ComputeCommand` | `BaseOperation::XTrim` | 单键读改写，裁剪 + 引用策略 |
 | `XAUTOCLAIM` | `ComputeCommand` | `BaseOperation::XAutoClaim` | 单键读改写，扫描 PEL 自动认领 |
+| `XSETID` | `ComputeCommand` | `BaseOperation::XSetId` | 单键读改写，更新内部 ID 元数据 |
+| `XACKDEL` | `ComputeCommand` | `BaseOperation::XAckDel` | 单键读改写，确认并删除 |
+| `XDELEX` | `ComputeCommand` | `BaseOperation::XDelex` | 单键读改写，按引用策略删除 |
 
-十一个命令同时注册到服务端工厂 `CommandFactory` 和 Lua 工厂 `RaftCommandFactory`，
+十四个命令同时注册到服务端工厂 `CommandFactory` 和 Lua 工厂 `RaftCommandFactory`，
 因此 `MULTI/EXEC` 与 `EVAL` 中同样可用。`XREVRANGE` / `XINFO` 属于第一批只读扩展，
-`XDEL` / `XTRIM` 属于第二批删除/裁剪扩展，`XAUTOCLAIM` 属于第三批自动认领扩展。
+`XDEL` / `XTRIM` 属于第二批删除/裁剪扩展，`XAUTOCLAIM` 属于第三批自动认领扩展，
+`XSETID` / `XACKDEL` / `XDELEX` 属于第四批元数据与 Redis 8.2 删除扩展。
 
 ### 2.1 与 Redis 语义对齐的细节
 
@@ -112,6 +116,23 @@
 - 回复为 `[next-start, claimed, deleted-ids]`；`claimed` 非 `JUSTID` 时是
   `[id, fields]`，`JUSTID` 时是 ID 数组。成功调用总会创建/触碰 consumer，因此会记录
   一次 stream 快照增量。
+
+### 2.5 元数据与 Redis 8.2 删除（第四批）
+
+- **XSETID**：`XSETID key last-id [ENTRIESADDED n] [MAXDELETEDID id]`。Last ID 与选项
+  在查 key 之前解析；`ENTRIESADDED` 为负报 `ERR entries_added must be positive`，
+  `MAXDELETEDID` 大于目标 ID 报 Redis 原文错误。执行时依次检查当前 tombstone、
+  stream 顶部条目和 `entries_added >= length`，错误文案与 Redis 一致；缺 key 返回
+  `ERR no such key`。`MAXDELETEDID 0-0` 表示保留现有 tombstone。
+- **XACKDEL**：`XACKDEL key group [KEEPREF|DELREF|ACKED] IDS numids id ...`。
+  先查类型、再解析选项、再查 group，最后才解析 ID，避免部分确认后才发现非法 ID。
+  缺 key 或缺 group 时按 `numids` 返回全 `-1`，不解析 ID。`ACKED` 只删除已不被任何
+  group 引用的条目，`DELREF` 会同时清理所有 group 的 PEL 引用，`KEEPREF` 保留 PEL。
+- **XDELEX**：`XDELEX key [KEEPREF|DELREF|ACKED] IDS numids id ...`。不要求 ID 在 PEL
+  中；`ACKED` 对仍被引用的条目返回 `2` 且不删除，`DELREF` 先清引用再删 payload，
+  `KEEPREF` 直接删 payload 并保留 PEL。缺 key 时返回全 `-1`。
+- 两者共用同一套 `IDS numids` / 引用策略解析与状态编码；状态值固定为
+  `-1`（不存在）、`1`（已删除）、`2`（仍被引用）。
 
 ## 3. 复制与快照
 
@@ -215,12 +236,13 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
 ## 6. 测试与验证
 
 - 单元 + 集成测试：`cargo test -p cache_cat --lib -- --skip test::tests::test_add`
-  → **585 passed / 0 failed**（`test_add` 是需要本地 5001 节点的手工测试）。
-- 覆盖点：十一个命令的参数/边界/错误文案、快照回放后的 PEL 一致性、generation 快照往返与
+  → **617 passed / 0 failed**（`test_add` 是需要本地 5001 节点的手工测试）。
+- 覆盖点：十四个命令的参数/边界/错误文案、快照回放后的 PEL 一致性、generation 快照往返与
   越界拒绝、过期 generation 被拒、单 group 单唤醒、多 group 各自唤醒、销毁后全部收到
   `NOGROUP`、非追加事件不扫描 XREAD、`XREVRANGE` 的 end/start 反转、`XINFO` 的
   RESP2/RESP3 形状与逻辑时钟时间、`XDEL`/`XTRIM` 的快照增量重放与引用策略、
-  `XAUTOCLAIM` 的游标/COUNT/JUSTID/删除清理与确定性写时钟。
+  `XAUTOCLAIM` 的游标/COUNT/JUSTID/删除清理与确定性写时钟、`XSETID` 的元数据校验、
+  `XACKDEL`/`XDELEX` 的状态数组与引用策略。
 - 真实单节点（debug 构建）验证：
   - `BLOCK 0` + `XGROUP DESTROY` → 立即收到 `NOGROUP`（不再永久挂起）；
   - 3 个阻塞消费者 + 一次 XADD → 只有 1 个被服务；下一次 XADD → 下一个；
@@ -235,12 +257,15 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
     才唤醒；
   - `XAUTOCLAIM` 的游标翻页、`COUNT`、`JUSTID`、`min-idle-time`、删除条目清理、
     错误优先级、`MULTI/EXEC` 与 `EVAL` 均正确；
+  - `XSETID` 的元数据更新与全部错误分支、`XACKDEL`/`XDELEX` 的状态数组与
+    `KEEPREF`/`DELREF`/`ACKED`、`MULTI/EXEC` 与 `EVAL` 均正确；
   - 快照写入头部为 `MCDC\x02`，重启后数据、消费者组与 PEL 正常恢复。
 
 ## 7. 已知限制与后续方向
 
-- **Redis 8 其余 stream 命令**尚未暴露：`XACKDEL`/`XDELEX`、`XSETID`。core 均已实现，
-  属协议层适配工作。
+- **Redis Stream 命令面已补齐**：`XLEN`、`XRANGE`、`XREVRANGE`、`XINFO`、`XACK`、
+  `XACKDEL`、`XCLAIM`、`XAUTOCLAIM`、`XDEL`、`XDELEX`、`XTRIM`、`XSETID`、`XGROUP`、
+  `XREAD`、`XREADGROUP`、`XADD` 均已暴露。
 - `DEL key` 不会唤醒阻塞客户端，与 Redis 的行为一致（DEL 不产生 stream 就绪信号）。
 - 阻塞的首次提交仍是一次 Raft 写（与 Redis 一致：空读也要创建/更新 consumer）。
 - 若等待期间 group 被销毁，客户端在收到 `NOGROUP` 时不会重试；这符合 Redis 语义。
@@ -250,6 +275,7 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
 ## 8. 提交列表
 
 ```
+230c4bf add XSETID, XACKDEL and XDELEX stream commands
 36d809c add XAUTOCLAIM stream command
 e4c159d add XDEL and XTRIM stream commands
 91e8886 add XREVRANGE and XINFO stream commands

@@ -18,8 +18,8 @@ The work has two parts:
    waiter re-checks its own state".
 
 A follow-up batch then added the read-only `XREVRANGE` and `XINFO` (section 2.2), a
-second batch added `XDEL` and `XTRIM` (section 2.3), and a third added `XAUTOCLAIM`
-(section 2.4).
+second batch added `XDEL` and `XTRIM` (section 2.3), a third added `XAUTOCLAIM`
+(section 2.4), and a fourth added `XSETID`, `XACKDEL` and `XDELEX` (section 2.5).
 
 ## 2. Commands
 
@@ -36,10 +36,13 @@ second batch added `XDEL` and `XTRIM` (section 2.3), and a third added `XAUTOCLA
 | `XDEL` | `ComputeCommand` | `BaseOperation::XDel` | removes entries |
 | `XTRIM` | `ComputeCommand` | `BaseOperation::XTrim` | trims with a reference policy |
 | `XAUTOCLAIM` | `ComputeCommand` | `BaseOperation::XAutoClaim` | scans the PEL and claims idle entries |
+| `XSETID` | `ComputeCommand` | `BaseOperation::XSetId` | updates internal ID metadata |
+| `XACKDEL` | `ComputeCommand` | `BaseOperation::XAckDel` | acknowledges and deletes |
+| `XDELEX` | `ComputeCommand` | `BaseOperation::XDelex` | deletes with a reference policy |
 
-All eleven are registered in both the server factory and the Lua factory, so they work inside
-`MULTI/EXEC` and `EVAL`; the last five arrived in the follow-up read-only, delete/trim and
-auto-claim batches.
+All fourteen are registered in both the server factory and the Lua factory, so they work
+inside `MULTI/EXEC` and `EVAL`; the last eight arrived in the follow-up read-only,
+delete/trim, auto-claim and metadata/Redis 8.2 delete batches.
 
 ### 2.1 Redis-compatible details
 
@@ -119,6 +122,26 @@ Checked against `redis/8.0` `src/t_stream.c`:
   or an ID array under `JUSTID`. A successful call always creates/touches the consumer, so it
   records a stream snapshot delta.
 
+### 2.5 Metadata and Redis 8.2 delete follow-up
+
+- **XSETID**: `XSETID key last-id [ENTRIESADDED n] [MAXDELETEDID id]`. The last ID and
+  options are parsed before the key lookup; a negative `ENTRIESADDED` reports
+  `ERR entries_added must be positive` and a `MAXDELETEDID` above the target reports Redis'
+  dedicated error. Execution checks the current tombstone, the stream top and
+  `entries_added >= length` with Redis' exact messages; a missing key is `ERR no such key`.
+  `MAXDELETEDID 0-0` keeps the existing tombstone.
+- **XACKDEL**: `XACKDEL key group [KEEPREF|DELREF|ACKED] IDS numids id ...`. It checks the
+  type, then the options, then the group, and only then parses IDs, so an invalid ID cannot
+  leave a partial acknowledgement behind. A missing key or group returns one `-1` per
+  requested ID without parsing IDs. `ACKED` deletes only entries no group still references,
+  `DELREF` clears every group's PEL references, and `KEEPREF` leaves the PEL alone.
+- **XDELEX**: `XDELEX key [KEEPREF|DELREF|ACKED] IDS numids id ...`. An ID need not be in the
+  PEL. `ACKED` returns `2` and keeps entries still referenced, `DELREF` clears references
+  before deleting, and `KEEPREF` deletes the payload while keeping PEL records. A missing key
+  returns all `-1`.
+- Both commands share the `IDS numids`/reference-policy parser and status encoder; the status
+  values are `-1` (missing), `1` (deleted) and `2` (still referenced).
+
 ## 3. Replication and snapshots
 
 - Reads go through `ReadOperation`; single-key writes through `BaseOperation` and
@@ -163,14 +186,15 @@ Checked against `redis/8.0` `src/t_stream.c`:
 
 ## 6. Verification
 
-- `cargo test -p cache_cat --lib -- --skip test::tests::test_add` → **585 passed / 0 failed**
+- `cargo test -p cache_cat --lib -- --skip test::tests::test_add` → **617 passed / 0 failed**
   (`test_add` needs a live node on port 5001).
-- Coverage includes argument/boundary/error text for all eleven commands, PEL equality after
+- Coverage includes argument/boundary/error text for all fourteen commands, PEL equality after
   snapshot replay, generation round-trips and rejection, one wake per group, per-group
   independent wakes, `NOGROUP` after destroy, no XREAD scans on non-append changes,
   XREVRANGE's end/start reversal, XINFO's RESP2/RESP3 shapes and clock-derived times,
-  XDEL/XTRIM snapshot replay and reference policies, and XAUTOCLAIM's cursor, COUNT, JUSTID,
-  PEL cleanup and deterministic write clock.
+  XDEL/XTRIM snapshot replay and reference policies, XAUTOCLAIM's cursor, COUNT, JUSTID,
+  PEL cleanup and deterministic write clock, XSETID's metadata validation, and
+  XACKDEL/XDELEX's status arrays and reference policies.
 - Real single node: `BLOCK 0` plus `XGROUP DESTROY` answers `NOGROUP` immediately; one append
   serves one of three blocked consumers and the next append serves the next; destroying another
   group leaves the waiter asleep; destroy+recreate plus `XADD` answers `NOGROUP` with an empty
@@ -179,13 +203,16 @@ Checked against `redis/8.0` `src/t_stream.c`:
   MULTI/EXEC and EVAL) behave correctly; XDEL/XTRIM handle deletion, trimming, LIMIT and all
   reference policies through MULTI/EXEC and EVAL, and blocked readers only wake on an append;
   XAUTOCLAIM pages with its cursor, honours COUNT/JUSTID/min-idle-time, cleans deleted PEL
-  records and reports argument errors before NOGROUP; snapshots are written as `MCDC\x02` and
-  restore data and PEL after a restart.
+  records and reports argument errors before NOGROUP; XSETID validates metadata and reports
+  every error branch; XACKDEL/XDELEX return the correct status arrays for all reference
+  policies through MULTI/EXEC and EVAL; snapshots are written as `MCDC\x02` and restore data
+  and PEL after a restart.
 
 ## 7. Known limits and next steps
 
-- Remaining stream commands are not exposed yet: `XACKDEL`/`XDELEX` and `XSETID`. Both exist
-  in the core; only protocol plumbing remains.
+- **The Redis Stream command surface is complete**: `XLEN`, `XRANGE`, `XREVRANGE`, `XINFO`,
+  `XACK`, `XACKDEL`, `XCLAIM`, `XAUTOCLAIM`, `XDEL`, `XDELEX`, `XTRIM`, `XSETID`, `XGROUP`,
+  `XREAD`, `XREADGROUP` and `XADD` are all exposed.
 - `DEL key` does not wake blocked clients, matching Redis (DEL produces no stream readiness).
 - The first submit of a blocking read is still a Raft write; an empty read still creates or
   touches the consumer, as Redis does.
@@ -195,6 +222,7 @@ Checked against `redis/8.0` `src/t_stream.c`:
 ## 8. Commits
 
 ```
+230c4bf add XSETID, XACKDEL and XDELEX stream commands
 36d809c add XAUTOCLAIM stream command
 e4c159d add XDEL and XTRIM stream commands
 91e8886 add XREVRANGE and XINFO stream commands
