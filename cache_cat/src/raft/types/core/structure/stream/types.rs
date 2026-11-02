@@ -57,7 +57,7 @@ pub struct GroupEntry {
     pub fields: Option<Fields>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReferencePolicy {
     #[default]
     KeepRef,
@@ -65,13 +65,13 @@ pub enum ReferencePolicy {
     Acked,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrimStrategy {
     MaxLen(usize),
     MinId(StreamId),
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrimMode {
     #[default]
     Exact,
@@ -80,7 +80,7 @@ pub enum TrimMode {
     Approximate { limit: Option<usize> },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrimOptions {
     pub strategy: TrimStrategy,
     pub mode: TrimMode,

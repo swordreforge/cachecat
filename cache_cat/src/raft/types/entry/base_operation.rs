@@ -31,8 +31,10 @@ use crate::protocol::set::srem::SRemReq;
 use crate::protocol::stream::xack::XAckReq;
 use crate::protocol::stream::xadd::XAddReq;
 use crate::protocol::stream::xclaim::XClaimReq;
+use crate::protocol::stream::xdel::XDelReq;
 use crate::protocol::stream::xgroup::XGroupReq;
 use crate::protocol::stream::xreadgroup::XReadGroupStreamReq;
+use crate::protocol::stream::xtrim::XTrimReq;
 use crate::protocol::string::append::AppendReq;
 use crate::protocol::string::decr::DecrReq;
 use crate::protocol::string::decrby::DecrByReq;
@@ -113,6 +115,8 @@ pub enum BaseOperation {
     XAck(XAckReq),
     XReadGroup(XReadGroupStreamReq),
     XClaim(XClaimReq),
+    XDel(XDelReq),
+    XTrim(XTrimReq),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

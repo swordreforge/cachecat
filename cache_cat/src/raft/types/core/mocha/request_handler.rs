@@ -193,6 +193,8 @@ fn base_request_inner(
         BaseOperation::XAck(param) => my_cache.x_ack(param, update),
         BaseOperation::XReadGroup(param) => my_cache.x_read_group(param, update),
         BaseOperation::XClaim(param) => my_cache.x_claim(param, update),
+        BaseOperation::XDel(param) => my_cache.x_del(param, update),
+        BaseOperation::XTrim(param) => my_cache.x_trim(param, update),
     }
 }
 

@@ -8,6 +8,8 @@ use std::ops::Bound;
 pub mod xack;
 pub mod xadd;
 pub mod xclaim;
+pub mod xdel;
+pub mod xgroup;
 pub mod xinfo;
 pub mod xlen;
 pub mod xpending;
@@ -15,8 +17,7 @@ pub mod xrange;
 pub mod xread;
 pub mod xreadgroup;
 pub mod xrevrange;
-
-pub mod xgroup;
+pub mod xtrim;
 
 pub(super) fn arg(value: &Value) -> Result<Bytes, ProtocolError> {
     value

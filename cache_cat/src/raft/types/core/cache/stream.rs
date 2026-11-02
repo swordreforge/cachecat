@@ -1,8 +1,10 @@
 use crate::error::ProtocolError;
 use crate::protocol::stream::xack::XAckReq;
 use crate::protocol::stream::xclaim::XClaimReq;
+use crate::protocol::stream::xdel::XDelReq;
 use crate::protocol::stream::xgroup::XGroupReq;
 use crate::protocol::stream::xreadgroup::XReadGroupStreamReq;
+use crate::protocol::stream::xtrim::XTrimReq;
 use crate::raft::types::core::mocha::core::{MyCache, Update};
 use crate::raft::types::core::response_value::Value;
 use bytes::Bytes;
@@ -49,6 +51,16 @@ impl MyCache {
 
     /// XCLAIM moves PEL ownership and rewrites delivery metadata.
     pub fn x_claim(&self, param: XClaimReq, update: &mut Update) -> Value {
+        self.execute_compute(param, update)
+    }
+
+    /// XDEL removes entry payloads but keeps PEL records and the last ID.
+    pub fn x_del(&self, param: XDelReq, update: &mut Update) -> Value {
+        self.execute_compute(param, update)
+    }
+
+    /// XTRIM removes entries from the head, applying the reference policy.
+    pub fn x_trim(&self, param: XTrimReq, update: &mut Update) -> Value {
         self.execute_compute(param, update)
     }
 }

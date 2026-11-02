@@ -400,3 +400,78 @@ fn xinfo_read_operations_roundtrip_through_bincode() {
         Operation::Read(crate::raft::types::entry::read_operation::ReadOperation::XInfo(_))
     ));
 }
+
+#[test]
+fn xdel_and_xtrim_replay_from_snapshot_deltas() {
+    let cache = MyCache::new(2).unwrap();
+    let restored = MyCache::new(2).unwrap();
+    for id in ["1-0", "2-0", "3-0"] {
+        apply(&cache, request(&["XADD", "s", id, "field", "value"]));
+        apply(&restored, request(&["XADD", "s", id, "field", "value"]));
+    }
+
+    let mut revision = 0;
+    let (deleted, mut queue) = apply_snapshot(&cache, &["XDEL", "s", "2-0"], &mut revision);
+    assert!(matches!(deleted, Value::Integer(1)));
+    let (trimmed, trim_queue) =
+        apply_snapshot(&cache, &["XTRIM", "s", "MAXLEN", "1"], &mut revision);
+    assert!(matches!(trimmed, Value::Integer(1)));
+    queue.extend(trim_queue);
+
+    replay(&restored, &queue);
+    assert!(matches!(
+        read(&restored, request(&["XLEN", "s"])),
+        Value::Integer(1)
+    ));
+    // The delta must preserve XDEL's tombstone even though replay ran XTRIM.
+    let Value::Map(stream_info) = read(&restored, request(&["XINFO", "STREAM", "s"])) else {
+        panic!("expected an XINFO STREAM map");
+    };
+    let max_deleted = stream_info
+        .iter()
+        .find(|(name, _)| name.string_bytes_clone().as_deref() == Some(b"max-deleted-entry-id"))
+        .map(|(_, value)| value.string_bytes_clone().unwrap())
+        .expect("max-deleted-entry-id must be reported");
+    assert_eq!(max_deleted.as_ref(), b"2-0");
+}
+
+#[test]
+fn approximate_xtrim_options_survive_snapshot_replay() {
+    let cache = MyCache::new(2).unwrap();
+    let restored = MyCache::new(2).unwrap();
+    for index in 1..=5 {
+        let id = format!("{index}-0");
+        apply(&cache, request(&["XADD", "s", &id, "field", "value"]));
+        apply(&restored, request(&["XADD", "s", &id, "field", "value"]));
+    }
+
+    let mut revision = 0;
+    let (trimmed, queue) = apply_snapshot(
+        &cache,
+        &["XTRIM", "s", "MAXLEN", "~", "0", "LIMIT", "2"],
+        &mut revision,
+    );
+    assert!(matches!(trimmed, Value::Integer(2)));
+    replay(&restored, &queue);
+    assert!(matches!(
+        read(&restored, request(&["XLEN", "s"])),
+        Value::Integer(3)
+    ));
+}
+
+#[test]
+fn xdel_and_xtrim_base_operations_roundtrip_through_bincode() {
+    let cases: [&[&str]; 2] = [
+        &["XDEL", "s", "1-0"],
+        &["XTRIM", "s", "MAXLEN", "~", "5", "LIMIT", "2"],
+    ];
+    for args in cases {
+        let operation = request(args);
+        let encoded = bincode2::serialize(&Request::new(CLOCK, DB, operation)).unwrap();
+        let decoded: Request = bincode2::deserialize(&encoded).unwrap();
+        assert!(matches!(
+            decoded.operation,
+            Operation::Base(BaseOperation::XDel(_) | BaseOperation::XTrim(_))
+        ));
+    }
+}
