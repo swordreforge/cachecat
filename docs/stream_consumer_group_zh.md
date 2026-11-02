@@ -225,6 +225,18 @@ enum StreamWaiter {
   非追加事件；group 等待者重新检查后看到 `WRONGTYPE`，普通 `XREAD` 仍然不动。
 - 没有等待者时不记录事件；快照回放 `effects` 为 `None`，不受影响。
 
+### 4.6 阻塞 XREADGROUP 的首次提交
+
+- 以前空阻塞 `>` 读会先提交一次 Raft 写，只为创建/触碰 consumer，然后才注册等待。
+  现在 `capture` 在全局锁内检查每个 key 是否有可读条目、是否包含历史读模式：
+  - 没有可读内容时只注册本地 waiter，**不提交** Raft 写；
+  - `XADD` 唤醒后才提交真正的组读，超时/断开则一次写都不产生。
+- 非阻塞读、历史读（显式 ID）以及已经有新条目的读仍然立即提交，保持 Redis 的
+  “空读也创建/触碰 consumer”行为。
+- 代价：等待期间 consumer 尚未创建，`XINFO CONSUMERS` / `XINFO GROUPS` 的 consumers
+  数量看不到它；首次实际交付时才出现，`seen-time` 也以交付时刻为准。这是去掉空闲
+  Raft 写的取舍。
+
 ## 5. 本轮顺带修复的两个既有问题
 
 ### 5.1 快照文件版本号没有跟上格式
@@ -275,6 +287,8 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
   - `DEL` / `UNLINK` 删除 stream 后，阻塞的 XREADGROUP 立即收到 `NOGROUP`；`SET` /
     `MSET` 覆盖 stream 时收到 `WRONGTYPE`；普通 XREAD 均保持阻塞，下一次 XADD 才唤醒；
     单键/多键路径与 `MULTI`、`EVAL` 行为一致；
+  - 空阻塞 XREADGROUP 等待期间 consumer 不存在；超时/断开后仍不存在；`XADD` 交付时
+    才创建并更新 PEL；非阻塞读、历史读和已有数据的读仍立即创建 consumer；
   - 快照写入头部为 `MCDC\x02`，重启后数据、消费者组与 PEL 正常恢复。
 
 ## 7. 已知限制与后续方向
@@ -282,7 +296,8 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
 - **Redis Stream 命令面已补齐**：`XLEN`、`XRANGE`、`XREVRANGE`、`XINFO`、`XACK`、
   `XACKDEL`、`XCLAIM`、`XAUTOCLAIM`、`XDEL`、`XDELEX`、`XTRIM`、`XSETID`、`XGROUP`、
   `XREAD`、`XREADGROUP`、`XADD` 均已暴露。
-- 阻塞的首次提交仍是一次 Raft 写（与 Redis 一致：空读也要创建/更新 consumer）。
+- 空阻塞 XREADGROUP 在等待/超时/断开期间不会创建 consumer，首次实际交付时才写入；
+  `XINFO` 在等待期间看不到该 consumer，这是去掉空闲 Raft 写的取舍。
 - 若等待期间 group 被销毁，客户端在收到 `NOGROUP` 时不会重试；这符合 Redis 语义。
 - 服务端仍使用 `Arc<RwLock<RedisStream>>`，`SharedStream` 自带的 Notify 阻塞栈未被使用；
   将来若要统一，需要先解决"本地阻塞不能绕过 Raft"这一前提。
@@ -290,6 +305,7 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
 ## 8. 提交列表
 
 ```
+d81dd47 defer the first Raft write of a blocking XREADGROUP
 ad05cc7 wake blocked consumer groups on UNLINK and stream overwrite
 3c6666f wake blocked consumer groups when DEL removes a stream
 230c4bf add XSETID, XACKDEL and XDELEX stream commands

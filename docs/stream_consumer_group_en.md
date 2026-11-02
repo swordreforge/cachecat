@@ -180,6 +180,15 @@ Checked against `redis/8.0` `src/t_stream.c`:
   `SET`/`MSET` that replace an existing stream with another type publish the same
   non-append event, so group waiters observe `WRONGTYPE` while plain XREAD stays asleep.
   No event is recorded without waiters, and snapshot replay keeps `effects = None`.
+- **First submit of a blocking XREADGROUP**: an empty `>` wait used to submit a Raft
+  write immediately just to create/touch the consumer. `capture` now checks under the
+  global locks whether any key has readable entries or a history mode; when nothing is
+  ready it registers a local waiter without submitting, and the real group read is
+  submitted only after an `XADD` wakes it. A timeout or disconnect therefore performs no
+  write at all. Non-blocking, history and already-ready reads still submit immediately and
+  keep Redis' create/touch behaviour. The trade-off is that the consumer is absent from
+  `XINFO CONSUMERS`/`XINFO GROUPS` while the client is idle and appears on first delivery,
+  with `seen-time` based on that delivery.
 
 ## 5. Two existing defects fixed along the way
 
@@ -216,22 +225,27 @@ Checked against `redis/8.0` `src/t_stream.c`:
   every error branch; XACKDEL/XDELEX return the correct status arrays for all reference
   policies through MULTI/EXEC and EVAL; DEL/UNLINK wakes a blocked XREADGROUP with
   `NOGROUP` and SET/MSET overwrite wakes it with `WRONGTYPE`, while a plain XREAD stays
-  blocked until the next XADD on single-key, multi-key, MULTI and EVAL paths; snapshots are
-  written as `MCDC\x02` and restore data and PEL after a restart.
+  blocked until the next XADD on single-key, multi-key, MULTI and EVAL paths; an empty
+  blocking XREADGROUP has no consumer while it waits, a timeout/disconnect creates none,
+  and XADD creates/touches it on delivery while non-blocking/history/ready reads still
+  create it immediately; snapshots are written as `MCDC\x02` and restore data and PEL
+  after a restart.
 
 ## 7. Known limits and next steps
 
 - **The Redis Stream command surface is complete**: `XLEN`, `XRANGE`, `XREVRANGE`, `XINFO`,
   `XACK`, `XACKDEL`, `XCLAIM`, `XAUTOCLAIM`, `XDEL`, `XDELEX`, `XTRIM`, `XSETID`, `XGROUP`,
   `XREAD`, `XREADGROUP` and `XADD` are all exposed.
-- The first submit of a blocking read is still a Raft write (as in Redis: an empty read still
-  creates or touches the consumer).
+- An empty blocking XREADGROUP creates no consumer while it waits (or on timeout/disconnect);
+  it appears on the first real delivery, so `XINFO` does not show it during the wait. This is
+  the trade-off for removing the idle Raft write.
 - The server keeps using `Arc<RwLock<RedisStream>>`; the `SharedStream` notification stack is
   unused and cannot become the authority while group reads must go through Raft.
 
 ## 8. Commits
 
 ```
+d81dd47 defer the first Raft write of a blocking XREADGROUP
 ad05cc7 wake blocked consumer groups on UNLINK and stream overwrite
 3c6666f wake blocked consumer groups when DEL removes a stream
 230c4bf add XSETID, XACKDEL and XDELEX stream commands
