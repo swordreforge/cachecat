@@ -1,0 +1,184 @@
+# Stream 消费组支持与阻塞唤醒设计
+
+本文档总结本轮为 cache-cat 补齐 Redis Stream 消费组命令、并重做阻塞唤醒链路所做的全部工作。
+实现已落在 `master` 分支（详见文末提交列表），全部行为都以真实节点和单元/集成测试验证过。
+
+## 1. 背景与范围
+
+改造前，Stream 只暴露了 `XADD`、`XGROUP`、`XREAD`，消费组读取（`XREADGROUP`）、
+待处理列表（`XPENDING`、`XACK`）和认领（`XCLAIM`）都缺少协议层入口。
+另一方面，阻塞读取的唤醒只由 `XADD` 触发，且所有等待者共用一份不区分类型的上下文，
+导致组读在唤醒后仍要提交无用的 Raft 写、group 被销毁时客户端会被挂起。
+
+本轮工作分两部分：
+
+1. 补齐 `XLEN`、`XRANGE`、`XACK`、`XREADGROUP`、`XPENDING`、`XCLAIM` 六个命令；
+2. 把阻塞唤醒从"只有追加才有事件"重构成"任意 stream 写入产生通用变更事件 + 等待者自检"。
+
+## 2. 新增命令
+
+| 命令 | trait | 复制载荷 | 说明 |
+| --- | --- | --- | --- |
+| `XLEN` | `ReadCommand` | `ReadOperation::XLen` | 单键读，返回条目数 |
+| `XRANGE` | `ReadCommand` | `ReadOperation::XRange` | 单键读，区间 + `COUNT` |
+| `XPENDING` | `ReadCommand` | `ReadOperation::XPending` | summary / extended 两种形式 |
+| `XACK` | `ComputeCommand` | `BaseOperation::XAck` | 单键读改写，清 PEL |
+| `XCLAIM` | `ComputeCommand` | `BaseOperation::XClaim` | 单键读改写，转移归属 |
+| `XREADGROUP` | 多键读写 | `RedisOperation::RedisXReadGroup` + 每键 `BaseOperation::XReadGroup` | 原子多键，快照按单键记录 |
+
+六个命令同时注册到服务端工厂 `CommandFactory` 和 Lua 工厂 `RaftCommandFactory`，
+因此 `MULTI/EXEC` 与 `EVAL` 中同样可用。
+
+### 2.1 与 Redis 语义对齐的细节
+
+实现前对照了 `redis/8.0` 的 `src/t_stream.c`，以下几个容易写错的点已逐条对齐：
+
+- **XRANGE 区间**：支持 `-`、`+`、`(id` 独占、裸毫秒（下界补 `-0`、上界补 `-MAX`）；
+  独占边界向内平移，溢出时报 `ERR invalid start/end ID for the interval`；
+  作为独占边界的 `(-` / `(+` 属于非法 ID；`COUNT 0`（含负数）在 **key 存在时**返回
+  null array，而 key 不存在时返回空数组；重复 `COUNT` 以最后一个为准。
+- **XACK**：先查 key → 类型 → group，**最后**才解析 ID。因此缺 key 或缺 group 时即使 ID
+  非法也返回 `0`；group 存在但 ID 非法才报 `ERR Invalid stream ID ...`。没有实际确认时
+  返回 `MochaOperation::Abort`，不产生快照增量。
+- **XREADGROUP**：`>` 表示新条目，显式 ID 表示消费者历史；`$`、`+` 报 Redis 原文错误；
+  `COUNT` / `BLOCK` / `NOACK` 均支持；`NOGROUP` 文案带 `in XREADGROUP with GROUP option`。
+- **XPENDING**：summary 返回 `[total, min, max, [[consumer, count], ...]]`；
+  extended 返回 `[id, consumer, idle, deliveries]`，支持 `IDLE`、区间、`count`、`consumer`；
+  `IDLE` 为负按 0 处理，`count` 为负按 0 处理。
+- **XCLAIM**：`min-idle-time`、`IDLE`、`TIME`、`RETRYCOUNT`、`FORCE`、`JUSTID`、`LASTID`
+  全部支持，ID 与选项可交错出现；`JUSTID` 只返回 ID。
+
+## 3. 复制与快照
+
+### 3.1 读写路径
+
+- **读**：`ReadOperation` → `read_request` → lease read + 读锁 → `ReadCommand`。
+- **单键写**：`BaseOperation` → `base_request` → `execute_compute`（快照 CAS 复用）。
+- **多键原子写**：`XREADGROUP` 整体作为 `RedisOperation::RedisXReadGroup` 进一条日志；
+  执行时逐 key 调用 `execute_compute(XReadGroupStreamReq)`，因此快照增量仍按**单键**
+  记录，恢复时是独立的 CAS 操作。
+
+### 3.2 逻辑时钟（确定性）
+
+消费组状态（PEL 的 `delivery_ms`、consumer 活跃时间、XPENDING 的 idle）都属于会被复制和
+快照的状态，不能使用各节点自己的物理时钟。核心层因此新增带时钟参数的方法：
+
+- `RedisStream::xreadgroup_at(...)`、`xclaim_at(...)`、`xpending_range_at(...)`
+- 协议层传入 `update.write_clock`；EXEC/Lua 内的读走 `execute_with_clock`，拿到同一个写时钟
+
+快照回放测试验证了：同一批操作在主节点与恢复节点上得到逐字节一致的 PEL。
+
+### 3.3 消费组 generation（stream 快照版本 4）
+
+仅靠内存里的 `Arc<()>` identity 无法跨节点比较，也无法防住"阻塞期间销毁并重建同名 group"
+后客户端静默接入新 group。为此新增**复制化的 group 世代号**：
+
+- `Group::generation` 由流内单调计数器 `next_group_generation` 在每次 `XGROUP CREATE` 时分配；
+- 随 stream 快照持久化（`SNAPSHOT_VERSION` 3 → 4，含恢复时范围校验与计数器续接）；
+- 阻塞的 `XREADGROUP` 在第一次提交前捕获每个 key 的 generation 写入 `expected_generations`；
+  apply 时逐 key 校验，不一致直接 `NOGROUP`。
+
+这条校验是**权威判据**：即使"销毁 + 重建"恰好发生在客户端本地检查与提交之间，也不会串读新 group。
+
+## 4. 阻塞唤醒
+
+### 4.1 等待器类型化
+
+原先 `WriteState::blocking_keys` 的上下文类型固定为 `XReadParams`，组读只能塞一个"令牌"，
+每次唤醒仍要跑一遍 XREAD 计算。现在统一为：
+
+```rust
+enum StreamWaiter {
+    Read(XReadParams),                                   // XREAD：载荷就是回复
+    Group { group: Bytes, identities: Vec<((u16, Bytes), Arc<()>)> },
+}
+```
+
+一个注册表服务两种等待者；唤醒时按类型分派，组等待者只做组状态判断。
+
+### 4.2 通用变更事件 + 追加标志
+
+`ApplyEffects::changed_streams` 从 `HashSet` 变为 `HashMap<(db, key), bool>`：
+
+- 事件在 **`execute_compute` 唯一一处**发出：任意成功的 stream 写入（XADD、XGROUP、XACK、
+  XCLAIM、XREADGROUP）都会登记该 key，新命令无需自己补唤醒代码；
+- `bool` 表示本批次是否**追加了条目**：XADD 是唯一增长 `entries_added` 的命令，
+  所以通过 mutation 前后比较 `entries_added` 得到，默认正确、不会因新命令漏标记；
+- 分派时 XREAD 等待者只在追加事件上被评估（XACK/XCLAIM/组读不再触发无意义的 XREAD 扫描），
+  组等待者仍评估所有事件（链式投递依赖游标推进这类非追加事件）。
+
+### 4.3 每 (key, group) 只唤醒一个 + 链式投递
+
+- 新条目事件只唤醒该 group 中**注册最早**的等待者；
+- 被唤醒者的组读本身是一条复制写，游标推进后又会发出通用事件；若仍有新条目，
+  下一个等待者被唤醒——写入次数与"非空读取次数"一致，投递保持恰好一次；
+- group 已销毁或已重建：**所有**该 group 的等待者都被唤醒，并且 `NOGROUP`
+  直接作为唤醒载荷返回，客户端不再提交注定失败的写；
+- 不同 group 互不影响（每个 group 各自唤醒一个）。
+
+### 4.4 时序与代价
+
+- 注册与"是否就绪"的检查都在全局写锁内完成；apply 也需要同一把锁，因此不会丢唤醒。
+- 同一 key 的组状态按 `(key, group)` 缓存一次（identity、`has_new`、"是否已唤醒"），
+  同一 group 的多个等待者只做一次 `Arc::ptr_eq`。
+- `wake_ready` 改为把该 key 的等待者队列整体取出、按注册顺序逐个 `pop_first`，
+  只把仍阻塞的 ID 用原节点放回；不再每次事件克隆整棵 `BTreeSet`。
+- 唤醒路径使用 `execute_multi_read_ref`，不再为每个阻塞的 XREAD 读者克隆
+  `XReadParams`（keys/ids 向量）。
+
+## 5. 本轮顺带修复的两个既有问题
+
+### 5.1 快照文件版本号没有跟上格式
+
+`docs/snapshot_zh.md` 写明动态元数据格式是版本 2，但 `snapshot_handler.rs` 的
+`VERSION` 常量一直是 1。结果是：新写的快照与旧的"内联 296 字节元数据"格式共用同一个
+版本字节，版本门形同虚设；测试 `snapshot_readers_reject_invalid_metadata_consistently`
+把版本 1 当作"旧版本"，因此一直失败。
+
+修复：`VERSION` 1 → 2，并把头部断言改为 `MCDC\x02`。现在旧格式文件会被明确拒绝。
+
+### 5.2 `#[serde(skip)]` 变体之后的枚举下标错位
+
+`RedisOperation` 的 `RedisEvalSha` 变体带 `#[serde(skip)]`。serde 派生在编码时按包含该变体的
+序号计数、解码时只认未跳过的变体，因此**任何声明在其后的变体都会写出越界下标**，表现为
+Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
+
+`RedisXReadGroup` 因此声明在 `RedisEvalSha` 之前，并新增 bincode 往返回归测试。
+后续若还要新增变体，应继续遵守这一约束（更彻底的做法是去掉该变体上的 `skip`）。
+
+## 6. 测试与验证
+
+- 单元 + 集成测试：`cargo test -p cache_cat --lib -- --skip test::tests::test_add`
+  → **529 passed / 0 failed**（`test_add` 是需要本地 5001 节点的手工测试）。
+- 覆盖点：六个命令的参数/边界/错误文案、快照回放后的 PEL 一致性、generation 快照往返与
+  越界拒绝、过期 generation 被拒、单 group 单唤醒、多 group 各自唤醒、销毁后全部收到
+  `NOGROUP`、非追加事件不扫描 XREAD。
+- 真实单节点（debug 构建）验证：
+  - `BLOCK 0` + `XGROUP DESTROY` → 立即收到 `NOGROUP`（不再永久挂起）；
+  - 3 个阻塞消费者 + 一次 XADD → 只有 1 个被服务；下一次 XADD → 下一个；
+  - 销毁其它 group 不影响当前 group 的等待者；
+  - 阻塞期间销毁并重建 + XADD → 返回 `NOGROUP`，新 group 的 PEL 保持为空；
+  - `EVAL` 内连续两次 XADD（单条日志）→ 两个消费者通过链式唤醒各拿一条；
+  - `XACK` 不唤醒阻塞的 XREAD，`XADD` 才唤醒；
+  - 快照写入头部为 `MCDC\x02`，重启后数据、消费者组与 PEL 正常恢复。
+
+## 7. 已知限制与后续方向
+
+- **Redis 8 其余 stream 命令**尚未暴露：`XAUTOCLAIM`、`XACKDEL`/`XDELEX`、`XTRIM`、
+  `XDEL`、`XINFO`、`XREVRANGE`、`XSETID`。core 大多已实现，属协议层适配工作。
+- `DEL key` 不会唤醒阻塞客户端，与 Redis 的行为一致（DEL 不产生 stream 就绪信号）。
+- 阻塞的首次提交仍是一次 Raft 写（与 Redis 一致：空读也要创建/更新 consumer）。
+- 若等待期间 group 被销毁，客户端在收到 `NOGROUP` 时不会重试；这符合 Redis 语义。
+- 服务端仍使用 `Arc<RwLock<RedisStream>>`，`SharedStream` 自带的 Notify 阻塞栈未被使用；
+  将来若要统一，需要先解决"本地阻塞不能绕过 Raft"这一前提。
+
+## 8. 提交列表
+
+```
+db95a9f trim allocations on the stream wake path
+c4ecf53 skip useless XREAD scans on non-append stream changes
+efce599 avoid needless Raft writes on stream wakeups
+70608ad fix stream blocking wakeups
+1efeea2 add stream consumer group commands
+c4f6d2e fix snapshot format version
+```
