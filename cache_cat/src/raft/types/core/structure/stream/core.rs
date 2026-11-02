@@ -247,6 +247,18 @@ impl RedisStream {
         self.last_generated_id
     }
 
+    /// Highest explicitly deleted ID, or ZERO when XDEL has not run.
+    pub fn max_deleted_entry_id(&self) -> StreamId {
+        self.max_deleted_entry_id
+    }
+
+    /// Last live entry ID, if the stream still has entries.
+    pub fn last_entry_id(&self) -> Option<StreamId> {
+        self.entries
+            .last_key_value()
+            .map(|(key, _)| StreamId::from_key(*key))
+    }
+
     /// Number of entries ever added. Only XADD grows it, which is how the apply
     /// path tells an append from a group/PEL-only change.
     pub fn entries_added(&self) -> u64 {

@@ -194,6 +194,9 @@ fn base_request_inner(
         BaseOperation::XReadGroup(param) => my_cache.x_read_group(param, update),
         BaseOperation::XClaim(param) => my_cache.x_claim(param, update),
         BaseOperation::XAutoClaim(param) => my_cache.x_autoclaim(param, update),
+        BaseOperation::XAckDel(param) => my_cache.x_ackdel(param, update),
+        BaseOperation::XDelex(param) => my_cache.x_delex(param, update),
+        BaseOperation::XSetId(param) => my_cache.x_setid(param, update),
         BaseOperation::XDel(param) => my_cache.x_del(param, update),
         BaseOperation::XTrim(param) => my_cache.x_trim(param, update),
     }

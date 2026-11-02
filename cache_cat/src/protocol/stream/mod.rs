@@ -1,15 +1,21 @@
 use crate::error::ProtocolError;
 use crate::protocol::option_eq;
 use crate::raft::types::core::response_value::Value;
-use crate::raft::types::core::structure::stream::{IdRange, StreamId};
+use crate::raft::types::core::structure::stream::{
+    DeleteStatus, IdRange, ReferencePolicy, StreamId,
+};
+use crate::utils::parse_canonical_i64;
 use bytes::Bytes;
 use std::ops::Bound;
+use std::str::FromStr;
 
 pub mod xack;
+pub mod xackdel;
 pub mod xadd;
 pub mod xautoclaim;
 pub mod xclaim;
 pub mod xdel;
+pub mod xdelex;
 pub mod xgroup;
 pub mod xinfo;
 pub mod xlen;
@@ -18,6 +24,7 @@ pub mod xrange;
 pub mod xread;
 pub mod xreadgroup;
 pub mod xrevrange;
+pub mod xsetid;
 pub mod xtrim;
 
 pub(super) fn arg(value: &Value) -> Result<Bytes, ProtocolError> {
@@ -113,6 +120,102 @@ pub(super) fn parse_count_option(items: &[Value]) -> Result<Option<usize>, Proto
         }
     }
     Ok(count)
+}
+
+/// Parse a reference-policy token shared by XTRIM, XACKDEL and XDELEX.
+pub(super) fn parse_reference_policy(option: &Bytes) -> Option<ReferencePolicy> {
+    if option_eq(option, b"KEEPREF") {
+        Some(ReferencePolicy::KeepRef)
+    } else if option_eq(option, b"DELREF") {
+        Some(ReferencePolicy::DelRef)
+    } else if option_eq(option, b"ACKED") {
+        Some(ReferencePolicy::Acked)
+    } else {
+        None
+    }
+}
+
+/// Parsed `[policy] IDS numids id ...` options used by XACKDEL and XDELEX.
+pub(super) struct DeleteArgs {
+    pub references: ReferencePolicy,
+    pub ids: Vec<Bytes>,
+}
+
+/// Parse the Redis 8.2 delete options. IDs stay raw so the command can check
+/// the key/group before validating them, matching Redis' error order.
+pub(super) fn parse_delete_args(args: &[Bytes]) -> Result<DeleteArgs, ProtocolError> {
+    let mut references = None;
+    let mut ids = None;
+    let mut index = 0;
+    while index < args.len() {
+        let option = &args[index];
+        if references.is_none()
+            && let Some(policy) = parse_reference_policy(option)
+        {
+            references = Some(policy);
+            index += 1;
+        } else if option_eq(option, b"IDS") && index + 1 < args.len() {
+            let numids = parse_canonical_i64(&args[index + 1]).ok_or_else(|| {
+                ProtocolError::response("ERR Number of IDs must be a positive integer")
+            })?;
+            if numids < 1 {
+                return Err(ProtocolError::response(
+                    "ERR Number of IDs must be a positive integer",
+                ));
+            }
+            let count = usize::try_from(numids).map_err(|_| {
+                ProtocolError::response("ERR Number of IDs must be a positive integer")
+            })?;
+            let start = index + 2;
+            if count > args.len() - start {
+                return Err(ProtocolError::response(
+                    "ERR The `numids` parameter must match the number of arguments",
+                ));
+            }
+            // Repeated IDS blocks follow Redis: the last one wins.
+            ids = Some(args[start..start + count].to_vec());
+            index = start + count;
+        } else {
+            return Err(ProtocolError::SyntaxError);
+        }
+    }
+    let ids = ids.ok_or_else(|| ProtocolError::response("ERR IDS option is required"))?;
+    Ok(DeleteArgs {
+        references: references.unwrap_or(ReferencePolicy::KeepRef),
+        ids,
+    })
+}
+
+/// Parse raw IDs with Redis' strict stream-ID rules (no `-`/`+`).
+pub(super) fn parse_strict_ids(raw: &[Bytes]) -> Result<Vec<StreamId>, ProtocolError> {
+    raw.iter()
+        .map(|raw| {
+            std::str::from_utf8(raw)
+                .ok()
+                .and_then(|text| StreamId::from_str(text).ok())
+                .ok_or_else(invalid_stream_id)
+        })
+        .collect()
+}
+
+pub(super) fn delete_status_reply(statuses: Vec<DeleteStatus>) -> Value {
+    Value::Array(Some(
+        statuses
+            .into_iter()
+            .map(|status| Value::Integer(status as i8 as i64))
+            .collect(),
+    ))
+}
+
+/// XACKDEL/XDELEX answer one `-1` per requested ID when the key or group is
+/// absent, so the caller still sees one status per ID.
+pub(super) fn not_found_statuses(count: usize) -> Value {
+    Value::Array(Some(vec![
+        Value::Integer(
+            DeleteStatus::NotFound as i8 as i64
+        );
+        count
+    ]))
 }
 
 // The NOGROUP replies live in the state-machine layer so the blocking

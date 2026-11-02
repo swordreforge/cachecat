@@ -260,7 +260,7 @@ pub enum DeleteStatus {
     StillReferenced = 2,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetIdOptions {
     pub entries_added: Option<u64>,
     /// ZERO leaves the existing tombstone marker unchanged.

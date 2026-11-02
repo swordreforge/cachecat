@@ -1,10 +1,13 @@
 use crate::error::ProtocolError;
 use crate::protocol::stream::xack::XAckReq;
+use crate::protocol::stream::xackdel::XAckDelReq;
 use crate::protocol::stream::xautoclaim::XAutoClaimReq;
 use crate::protocol::stream::xclaim::XClaimReq;
 use crate::protocol::stream::xdel::XDelReq;
+use crate::protocol::stream::xdelex::XDelexReq;
 use crate::protocol::stream::xgroup::XGroupReq;
 use crate::protocol::stream::xreadgroup::XReadGroupStreamReq;
+use crate::protocol::stream::xsetid::XSetIdReq;
 use crate::protocol::stream::xtrim::XTrimReq;
 use crate::raft::types::core::mocha::core::{MyCache, Update};
 use crate::raft::types::core::response_value::Value;
@@ -57,6 +60,21 @@ impl MyCache {
 
     /// XAUTOCLAIM scans the PEL and transfers all sufficiently idle entries.
     pub fn x_autoclaim(&self, param: XAutoClaimReq, update: &mut Update) -> Value {
+        self.execute_compute(param, update)
+    }
+
+    /// XACKDEL acknowledges PEL entries and deletes their payloads.
+    pub fn x_ackdel(&self, param: XAckDelReq, update: &mut Update) -> Value {
+        self.execute_compute(param, update)
+    }
+
+    /// XDELEX deletes payloads according to the reference policy.
+    pub fn x_delex(&self, param: XDelexReq, update: &mut Update) -> Value {
+        self.execute_compute(param, update)
+    }
+
+    /// XSETID updates last-generated-ID and logical counters.
+    pub fn x_setid(&self, param: XSetIdReq, update: &mut Update) -> Value {
         self.execute_compute(param, update)
     }
 

@@ -1,5 +1,6 @@
 //! Stream commands must behave the same through the Raft read/write paths.
 
+use crate::error::ProtocolError;
 use crate::protocol::raft_command::RaftCommandFactory;
 use crate::protocol::stream::xreadgroup::XReadGroupReq;
 use crate::raft::types::core::mocha::core::{MyCache, Update, UpdateType};
@@ -14,14 +15,16 @@ use bytes::Bytes;
 const DB: u16 = 1;
 const CLOCK: u64 = 1_000;
 
-fn request(args: &[&str]) -> Operation {
+fn try_request(args: &[&str]) -> Result<Operation, ProtocolError> {
     let items = args
         .iter()
         .map(|arg| Value::BulkString(Some(Bytes::copy_from_slice(arg.as_bytes()))))
         .collect::<Vec<_>>();
-    RaftCommandFactory::init_lua()
-        .parse_request(&items)
-        .unwrap_or_else(|error| panic!("{}: {error}", args[0]))
+    RaftCommandFactory::init_lua().parse_request(&items)
+}
+
+fn request(args: &[&str]) -> Operation {
+    try_request(args).unwrap_or_else(|error| panic!("{}: {error}", args[0]))
 }
 
 fn apply(cache: &MyCache, operation: Operation) -> Value {
@@ -564,4 +567,173 @@ fn xautoclaim_base_operation_roundtrips_through_bincode() {
         decoded.operation,
         Operation::Base(BaseOperation::XAutoClaim(_))
     ));
+}
+
+fn integer_items(reply: &Value) -> Vec<i64> {
+    let Value::Array(Some(items)) = reply else {
+        panic!("expected an array, got {reply:?}");
+    };
+    items
+        .iter()
+        .map(|value| {
+            let Value::Integer(item) = value else {
+                panic!("expected an integer, got {value:?}");
+            };
+            *item
+        })
+        .collect()
+}
+
+#[test]
+fn xsetid_updates_metadata_and_replays_deterministically() {
+    let cache = MyCache::new(2).unwrap();
+    let restored = MyCache::new(2).unwrap();
+    for id in ["1-0", "2-0"] {
+        apply(&cache, request(&["XADD", "s", id, "field", "value"]));
+        apply(&restored, request(&["XADD", "s", id, "field", "value"]));
+    }
+
+    let mut revision = 0;
+    let (reply, queue) = apply_snapshot(
+        &cache,
+        &[
+            "XSETID",
+            "s",
+            "10-0",
+            "ENTRIESADDED",
+            "20",
+            "MAXDELETEDID",
+            "3-0",
+        ],
+        &mut revision,
+    );
+    assert!(matches!(reply, Value::SimpleString(ref status) if status == "OK"));
+    replay(&restored, &queue);
+
+    let before = read(&cache, request(&["XINFO", "STREAM", "s"]));
+    let after = read(&restored, request(&["XINFO", "STREAM", "s"]));
+    assert_eq!(before.encode_proto(2), after.encode_proto(2));
+    assert_eq!(before.encode_proto(3), after.encode_proto(3));
+
+    // Redis reports a missing key only after the arguments are valid.
+    assert!(matches!(
+        apply(&cache, request(&["XSETID", "missing", "1-0"])),
+        Value::Error(ref message) if message == "ERR no such key"
+    ));
+    assert!(matches!(
+        try_request(&["XSETID", "missing", "bogus"]),
+        Err(ProtocolError::Response(ref message))
+            if message.starts_with("ERR Invalid stream ID")
+    ));
+    assert!(matches!(
+        apply(&cache, request(&["XSETID", "s", "1-0"])),
+        Value::Error(ref message) if message.contains("current max_deleted_entry_id")
+    ));
+}
+
+#[test]
+fn xackdel_acknowledges_and_deletes_through_the_raft_path() {
+    let cache = MyCache::new(2).unwrap();
+    seed_group(&cache);
+    apply(
+        &cache,
+        request(&["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"]),
+    );
+
+    let reply = apply(
+        &cache,
+        request(&["XACKDEL", "s", "g", "IDS", "2", "1-0", "2-0"]),
+    );
+    assert_eq!(integer_items(&reply), [1, 1]);
+    assert!(matches!(
+        read(&cache, request(&["XLEN", "s"])),
+        Value::Integer(0)
+    ));
+    let Value::Array(Some(summary)) = read(&cache, request(&["XPENDING", "s", "g"])) else {
+        panic!("expected an XPENDING summary");
+    };
+    assert!(matches!(summary[0], Value::Integer(0)));
+
+    // A missing group reports one -1 per ID and leaves the PEL untouched.
+    apply(&cache, request(&["XADD", "s", "3-0", "field", "three"]));
+    apply(
+        &cache,
+        request(&["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"]),
+    );
+    let reply = apply(
+        &cache,
+        request(&["XACKDEL", "s", "nope", "IDS", "1", "3-0"]),
+    );
+    assert_eq!(integer_items(&reply), [-1]);
+    let Value::Array(Some(summary)) = read(&cache, request(&["XPENDING", "s", "g"])) else {
+        panic!("expected an XPENDING summary");
+    };
+    assert!(matches!(summary[0], Value::Integer(1)));
+}
+
+#[test]
+fn xdelex_deletes_with_the_reference_policy() {
+    let cache = MyCache::new(2).unwrap();
+    seed_group(&cache);
+    apply(
+        &cache,
+        request(&["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"]),
+    );
+
+    // ACKED keeps entries still referenced by the group.
+    let reply = apply(
+        &cache,
+        request(&["XDELEX", "s", "ACKED", "IDS", "2", "1-0", "2-0"]),
+    );
+    assert_eq!(integer_items(&reply), [2, 2]);
+    assert!(matches!(
+        read(&cache, request(&["XLEN", "s"])),
+        Value::Integer(2)
+    ));
+
+    // DELREF removes the payloads and their PEL references.
+    let reply = apply(
+        &cache,
+        request(&["XDELEX", "s", "DELREF", "IDS", "2", "1-0", "2-0"]),
+    );
+    assert_eq!(integer_items(&reply), [1, 1]);
+    assert!(matches!(
+        read(&cache, request(&["XLEN", "s"])),
+        Value::Integer(0)
+    ));
+    let Value::Array(Some(summary)) = read(&cache, request(&["XPENDING", "s", "g"])) else {
+        panic!("expected an XPENDING summary");
+    };
+    assert!(matches!(summary[0], Value::Integer(0)));
+
+    let reply = apply(&cache, request(&["XDELEX", "missing", "IDS", "1", "1-0"]));
+    assert_eq!(integer_items(&reply), [-1]);
+}
+
+#[test]
+fn final_stream_base_operations_roundtrip_through_bincode() {
+    let cases: [&[&str]; 3] = [
+        &[
+            "XSETID",
+            "s",
+            "10-0",
+            "ENTRIESADDED",
+            "20",
+            "MAXDELETEDID",
+            "3-0",
+        ],
+        &["XACKDEL", "s", "g", "ACKED", "IDS", "1", "1-0"],
+        &["XDELEX", "s", "DELREF", "IDS", "1", "1-0"],
+    ];
+    for args in cases {
+        let operation = request(args);
+        let encoded = bincode2::serialize(&Request::new(CLOCK, DB, operation)).unwrap();
+        let decoded: Request = bincode2::deserialize(&encoded).unwrap();
+        assert!(matches!(
+            decoded.operation,
+            Operation::Base(
+                BaseOperation::XSetId(_) | BaseOperation::XAckDel(_) | BaseOperation::XDelex(_)
+            )
+        ));
+    }
 }

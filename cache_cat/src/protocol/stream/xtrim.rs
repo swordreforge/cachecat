@@ -34,6 +34,8 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use super::parse_reference_policy;
+
 /// Replicated XTRIM request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XTrimReq {
@@ -56,18 +58,6 @@ impl fmt::Display for XTrimReq {
 
 fn syntax(message: &'static str) -> ProtocolError {
     ProtocolError::response(message)
-}
-
-fn parse_reference(option: &Bytes) -> Option<ReferencePolicy> {
-    if option_eq(option, b"KEEPREF") {
-        Some(ReferencePolicy::KeepRef)
-    } else if option_eq(option, b"DELREF") {
-        Some(ReferencePolicy::DelRef)
-    } else if option_eq(option, b"ACKED") {
-        Some(ReferencePolicy::Acked)
-    } else {
-        None
-    }
 }
 
 /// Split an optional `~`/`=` operator from its threshold.
@@ -147,7 +137,7 @@ impl XTrimReq {
                 limit_given = true;
                 index += 2;
             } else if references.is_none()
-                && let Some(reference) = parse_reference(&option)
+                && let Some(reference) = parse_reference_policy(&option)
             {
                 references = Some(reference);
                 index += 1;
