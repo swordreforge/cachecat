@@ -412,7 +412,7 @@ fn inspect_group(my_cache: &MyCache, key: &(u16, Bytes), group: &[u8]) -> GroupS
 mod tests {
     use super::*;
     use crate::mocha::{EntrySnapshot, ExpirePolicy};
-    use crate::protocol::key::del::DelReq;
+    use crate::protocol::key::del::{DelParams, DelReq};
     use crate::protocol::key::persist::PersistReq;
     use crate::protocol::lua::eval::EvalParams;
     use crate::protocol::stream::xadd::XAddReq;
@@ -1516,5 +1516,122 @@ mod tests {
         assert!(matches!(old_payload, Value::Error(ref error) if error.starts_with("NOGROUP")));
         let (_, new_payload) = new.wait().now_or_never().unwrap().unwrap();
         assert!(matches!(new_payload, Value::SimpleString(_)));
+    }
+
+    #[tokio::test]
+    async fn del_wakes_blocked_group_waiters_with_nogroup() {
+        use futures::FutureExt;
+
+        let cache = MyCache::new(2).unwrap();
+        let key = Bytes::from_static(b"stream");
+        seed_group_at_tail(&cache, &key).await;
+        let group = Bytes::from_static(b"g");
+        let identities = group_identities(&cache, &key, b"g");
+        let waiter = group_waiter(&cache, &key, &group, &identities).await;
+
+        let deleted = apply(
+            &cache,
+            Operation::Base(BaseOperation::Del(DelReq { key: key.clone() })),
+            0,
+            3,
+        )
+        .await;
+        assert!(matches!(deleted, Value::Integer(1)));
+        assert_eq!(
+            cache.write_lock.lock().await.blocking_keys.waiter_count(),
+            0,
+            "DEL must detach the blocked group waiter"
+        );
+
+        let (_, payload) = waiter
+            .wait()
+            .now_or_never()
+            .expect("DEL wakes the group waiter")
+            .unwrap();
+        assert!(
+            matches!(payload, Value::Error(ref error) if error.starts_with("NOGROUP")),
+            "{payload:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_key_del_wakes_every_group_waiter() {
+        use futures::FutureExt;
+
+        let cache = MyCache::new(2).unwrap();
+        let first = Bytes::from_static(b"stream-one");
+        let second = Bytes::from_static(b"stream-two");
+        let group = Bytes::from_static(b"g");
+        seed_group_at_tail(&cache, &first).await;
+        seed_group_at_tail(&cache, &second).await;
+        let first_waiter = group_waiter(
+            &cache,
+            &first,
+            &group,
+            &group_identities(&cache, &first, b"g"),
+        )
+        .await;
+        let second_waiter = group_waiter(
+            &cache,
+            &second,
+            &group,
+            &group_identities(&cache, &second, b"g"),
+        )
+        .await;
+
+        let deleted = apply(
+            &cache,
+            Operation::Redis(RedisOperation::RedisDel(DelParams {
+                keys: vec![first, second],
+            })),
+            0,
+            3,
+        )
+        .await;
+        assert!(matches!(deleted, Value::Integer(2)));
+        assert_eq!(
+            cache.write_lock.lock().await.blocking_keys.waiter_count(),
+            0
+        );
+
+        for waiter in [first_waiter, second_waiter] {
+            let (_, payload) = waiter.wait().now_or_never().unwrap().unwrap();
+            assert!(
+                matches!(payload, Value::Error(ref error) if error.starts_with("NOGROUP")),
+                "{payload:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn del_does_not_wake_blocked_plain_xread_waiters() {
+        let cache = MyCache::new(2).unwrap();
+        let key = Bytes::from_static(b"stream");
+        apply(&cache, xadd(&key, AddId::Auto), 0, 1).await;
+        let mut reader = cache
+            .write_lock
+            .lock()
+            .await
+            .register_stream(
+                vec![(0, key.clone())],
+                None,
+                StreamWaiter::Read(read_params(&key)),
+            )
+            .unwrap();
+
+        let deleted = apply(
+            &cache,
+            Operation::Base(BaseOperation::Del(DelReq { key: key.clone() })),
+            0,
+            2,
+        )
+        .await;
+        assert!(matches!(deleted, Value::Integer(1)));
+        assert_eq!(
+            cache.write_lock.lock().await.blocking_keys.waiter_count(),
+            1,
+            "DEL must not evaluate (and therefore wake) a plain XREAD"
+        );
+        assert!(reader.cancel().await);
     }
 }

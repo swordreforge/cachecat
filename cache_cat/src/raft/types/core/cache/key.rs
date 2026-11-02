@@ -9,6 +9,7 @@ use crate::protocol::key::unlink::{UnlinkParams, UnlinkReq};
 use crate::protocol::set::spop::SPopReq;
 use crate::raft::types::core::mocha::core::{MyCache, Update, UpdateType, next_snapshot_revision};
 use crate::raft::types::core::response_value::Value;
+use crate::raft::types::core::value_object::ValueObject;
 use crate::raft::types::entry::base_operation::{BaseOperation, InsertReq};
 use crate::raft::types::entry::request::AtomicRequest;
 use crate::utils::OptionalU64;
@@ -132,16 +133,18 @@ impl MyCache {
             Err(err) => return err,
             Ok(cache) => &cache.mocha,
         };
+        let mut deleted_stream = None;
         //是否删除了元素
-        match update.update_type {
-            UpdateType::None => {
-                let existed = cache.remove(&del_req.key);
-                if existed.is_some() {
+        let reply = match update.update_type {
+            UpdateType::None => match cache.remove(&del_req.key) {
+                Some(value) => {
+                    if matches!(value.data, ValueObject::Stream(_)) {
+                        deleted_stream = Some(del_req.key.clone());
+                    }
                     Value::Integer(1)
-                } else {
-                    Value::Integer(0)
                 }
-            }
+                None => Value::Integer(0),
+            },
 
             UpdateType::Snapshot { queue, revision } => {
                 // remove returns only logically live entries, so missing or
@@ -149,6 +152,9 @@ impl MyCache {
                 let Some(entry) = cache.remove(&del_req.key) else {
                     return Value::Integer(0);
                 };
+                if matches!(entry.data, ValueObject::Stream(_)) {
+                    deleted_stream = Some(del_req.key.clone());
+                }
                 queue.push(AtomicRequest {
                     expected_revision: OptionalU64::some(entry.version),
                     version: next_snapshot_revision(revision),
@@ -164,12 +170,20 @@ impl MyCache {
                 if let Some(entry) = cache.get(&del_req.key)
                     && expected_revision.get() == Some(entry.version)
                 {
+                    if matches!(entry.data, ValueObject::Stream(_)) {
+                        deleted_stream = Some(del_req.key.clone());
+                    }
                     cache.remove(&del_req.key);
-                    return Value::Integer(1);
+                    Value::Integer(1)
+                } else {
+                    Value::Integer(0)
                 }
-                Value::Integer(0)
             }
+        };
+        if let Some(key) = deleted_stream {
+            update.mark_deleted_stream(&key);
         }
+        reply
     }
 
     pub fn flush_db(&self, req: FlushDBReq, update: &mut Update, external: bool) -> Value {

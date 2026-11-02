@@ -315,6 +315,28 @@ pub struct Update<'a> {
     pub waiters: Option<&'a mut WriteState>,
 }
 
+impl Update<'_> {
+    /// A deleted stream invalidates blocked XREADGROUP waiters even though no
+    /// stream value remains. Publish it as a non-append change so plain XREAD
+    /// readers stay asleep while group waiters re-check their group and answer
+    /// NOGROUP. Nothing is recorded when no client is blocked on the key.
+    pub(crate) fn mark_deleted_stream(&mut self, key: &Bytes) {
+        if self.effects.is_none()
+            || !self
+                .waiters
+                .as_deref()
+                .is_some_and(|waiters| !waiters.blocking_keys.is_empty())
+        {
+            return;
+        }
+        if let Some(effects) = self.effects.as_deref_mut() {
+            effects
+                .changed_streams
+                .insert((self.db_number, key.clone()), false);
+        }
+    }
+}
+
 pub enum UpdateType<'a> {
     //正常运行
     None,
