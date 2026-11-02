@@ -152,13 +152,15 @@ impl MyCache {
         // XADD is the only stream command that grows `entries_added`. Comparing
         // it around the mutation stays correct if a future command appends,
         // unlike a per-command flag someone could forget to set.
-        let pre_entries_added = if notify_waiters {
-            entry.as_ref().and_then(|entry| match &entry.value.data {
-                ValueObject::Stream(stream) => Some(stream.read().entries_added()),
-                _ => None,
-            })
+        let (pre_stream, pre_entries_added) = if notify_waiters {
+            entry
+                .as_ref()
+                .map_or((false, None), |entry| match &entry.value.data {
+                    ValueObject::Stream(stream) => (true, Some(stream.read().entries_added())),
+                    _ => (false, None),
+                })
         } else {
-            None
+            (false, None)
         };
         let (changed, response) = match entry {
             Some(mut entry) => {
@@ -183,17 +185,18 @@ impl MyCache {
             UpdateType::Snapshot { revision, .. } => next_snapshot_revision(revision),
             UpdateType::CAS { revision, .. } => *revision,
         };
-        // One generic event covers every stream write: XADD, XGROUP, XACK,
-        // XCLAIM and XREADGROUP all rewrite a stream value. Waiters re-evaluate
-        // on wake, so no command has to remember to publish its own event.
-        let notify_key = (notify_waiters
-            && matches!(
-                &changed,
-                MochaOperation::Insert { value, .. }
-                    if matches!(&value.data, ValueObject::Stream(_))
-            ))
-        .then(|| (update.db_number, key.clone()));
-        let appended = notify_key.is_some()
+        // One generic event covers every stream write, plus writes that replace
+        // a stream with another type (SET/MSET overwrite): XREADGROUP must see
+        // the deletion and answer NOGROUP/WRONGTYPE, while plain XREAD sleeps.
+        let post_stream = matches!(
+            &changed,
+            MochaOperation::Insert { value, .. }
+                if matches!(&value.data, ValueObject::Stream(_))
+        );
+        let notify_key = (notify_waiters && (post_stream || (pre_stream && !post_stream)))
+            .then(|| (update.db_number, key.clone()));
+        let appended = post_stream
+            && notify_key.is_some()
             && match &changed {
                 MochaOperation::Insert { value, .. } => match &value.data {
                     ValueObject::Stream(stream) => {

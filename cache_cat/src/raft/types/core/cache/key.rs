@@ -87,11 +87,18 @@ impl MyCache {
             Err(err) => return err,
             Ok(cache) => &cache.mocha,
         };
+        let mut deleted_stream = None;
         //是否删除了元素
-        match update.update_type {
+        let reply = match update.update_type {
             UpdateType::None => {
+                let was_stream = cache
+                    .get(&del_req.key)
+                    .is_some_and(|value| matches!(value.data, ValueObject::Stream(_)));
                 let existed = cache.unlink(&del_req.key);
                 if existed {
+                    if was_stream {
+                        deleted_stream = Some(del_req.key.clone());
+                    }
                     Value::Integer(1)
                 } else {
                     Value::Integer(0)
@@ -104,6 +111,9 @@ impl MyCache {
                 };
                 if !cache.unlink(&del_req.key) {
                     return Value::Integer(0);
+                }
+                if matches!(entry.data, ValueObject::Stream(_)) {
+                    deleted_stream = Some(del_req.key.clone());
                 }
                 queue.push(AtomicRequest {
                     expected_revision: OptionalU64::some(entry.version),
@@ -120,12 +130,20 @@ impl MyCache {
                 if let Some(entry) = cache.get(&del_req.key)
                     && expected_revision.get() == Some(entry.version)
                 {
+                    if matches!(entry.data, ValueObject::Stream(_)) {
+                        deleted_stream = Some(del_req.key.clone());
+                    }
                     cache.remove(&del_req.key);
-                    return Value::Integer(1);
+                    Value::Integer(1)
+                } else {
+                    Value::Integer(0)
                 }
-                Value::Integer(0)
             }
+        };
+        if let Some(key) = deleted_stream {
+            update.mark_deleted_stream(&key);
         }
+        reply
     }
 
     pub fn del(&self, del_req: DelReq, update: &mut Update) -> Value {

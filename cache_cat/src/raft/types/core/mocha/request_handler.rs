@@ -414,9 +414,11 @@ mod tests {
     use crate::mocha::{EntrySnapshot, ExpirePolicy};
     use crate::protocol::key::del::{DelParams, DelReq};
     use crate::protocol::key::persist::PersistReq;
+    use crate::protocol::key::unlink::UnlinkReq;
     use crate::protocol::lua::eval::EvalParams;
     use crate::protocol::stream::xadd::XAddReq;
     use crate::protocol::stream::xread::{XReadId, XReadParams};
+    use crate::protocol::string::set::SetReq;
     use crate::protocol::transaction::QueuedOperation;
     use crate::protocol::transaction::exec::ExecParams;
     use crate::raft::types::core::mocha::core::StreamRegistration;
@@ -1601,6 +1603,104 @@ mod tests {
                 "{payload:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn set_overwriting_a_stream_wakes_group_waiters_with_wrongtype() {
+        use futures::FutureExt;
+
+        let cache = MyCache::new(2).unwrap();
+        let key = Bytes::from_static(b"stream");
+        seed_group_at_tail(&cache, &key).await;
+        let group = Bytes::from_static(b"g");
+        let group_waiter =
+            group_waiter(&cache, &key, &group, &group_identities(&cache, &key, b"g")).await;
+        let mut reader = cache
+            .write_lock
+            .lock()
+            .await
+            .register_stream(
+                vec![(0, key.clone())],
+                None,
+                StreamWaiter::Read(read_params(&key)),
+            )
+            .unwrap();
+
+        let reply = apply(
+            &cache,
+            Operation::Base(BaseOperation::Set(SetReq {
+                key: key.clone(),
+                value: Bytes::from_static(b"value"),
+                ex_time: 0,
+            })),
+            0,
+            3,
+        )
+        .await;
+        assert!(matches!(reply, Value::SimpleString(ref status) if status == "OK"));
+
+        let (_, payload) = group_waiter
+            .wait()
+            .now_or_never()
+            .expect("SET wakes the group waiter")
+            .unwrap();
+        assert!(
+            matches!(payload, Value::Error(ref error) if error.starts_with("WRONGTYPE")),
+            "{payload:?}"
+        );
+        assert_eq!(
+            cache.write_lock.lock().await.blocking_keys.waiter_count(),
+            1,
+            "SET must not evaluate a plain XREAD"
+        );
+        assert!(reader.cancel().await);
+    }
+
+    #[tokio::test]
+    async fn unlink_wakes_group_waiters_but_not_plain_xread() {
+        use futures::FutureExt;
+
+        let cache = MyCache::new(2).unwrap();
+        let key = Bytes::from_static(b"stream");
+        seed_group_at_tail(&cache, &key).await;
+        let group = Bytes::from_static(b"g");
+        let group_waiter =
+            group_waiter(&cache, &key, &group, &group_identities(&cache, &key, b"g")).await;
+        let mut reader = cache
+            .write_lock
+            .lock()
+            .await
+            .register_stream(
+                vec![(0, key.clone())],
+                None,
+                StreamWaiter::Read(read_params(&key)),
+            )
+            .unwrap();
+
+        let reply = apply(
+            &cache,
+            Operation::Base(BaseOperation::Unlink(UnlinkReq { key: key.clone() })),
+            0,
+            3,
+        )
+        .await;
+        assert!(matches!(reply, Value::Integer(1)));
+
+        let (_, payload) = group_waiter
+            .wait()
+            .now_or_never()
+            .expect("UNLINK wakes the group waiter")
+            .unwrap();
+        assert!(
+            matches!(payload, Value::Error(ref error) if error.starts_with("NOGROUP")),
+            "{payload:?}"
+        );
+        assert_eq!(
+            cache.write_lock.lock().await.blocking_keys.waiter_count(),
+            1,
+            "UNLINK must not evaluate a plain XREAD"
+        );
+        assert!(reader.cancel().await);
     }
 
     #[tokio::test]
