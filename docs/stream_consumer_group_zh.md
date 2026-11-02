@@ -15,8 +15,9 @@
 1. 补齐 `XLEN`、`XRANGE`、`XACK`、`XREADGROUP`、`XPENDING`、`XCLAIM` 六个命令；
 2. 把阻塞唤醒从"只有追加才有事件"重构成"任意 stream 写入产生通用变更事件 + 等待者自检"。
 
-之后又完成了两批增量：第一批补齐只读的 `XREVRANGE` 与 `XINFO`（见 2.2），
-第二批补齐删除/裁剪的 `XDEL` 与 `XTRIM`（见 2.3）。
+之后又完成了三批增量：第一批补齐只读的 `XREVRANGE` 与 `XINFO`（见 2.2），
+第二批补齐删除/裁剪的 `XDEL` 与 `XTRIM`（见 2.3），第三批补齐自动认领的
+`XAUTOCLAIM`（见 2.4）。
 
 ## 2. 新增命令
 
@@ -32,10 +33,11 @@
 | `XINFO` | `ReadCommand` | `ReadOperation::XInfo` | `STREAM` / `GROUPS` / `CONSUMERS` / `HELP` |
 | `XDEL` | `ComputeCommand` | `BaseOperation::XDel` | 单键读改写，删除条目 |
 | `XTRIM` | `ComputeCommand` | `BaseOperation::XTrim` | 单键读改写，裁剪 + 引用策略 |
+| `XAUTOCLAIM` | `ComputeCommand` | `BaseOperation::XAutoClaim` | 单键读改写，扫描 PEL 自动认领 |
 
-十个命令同时注册到服务端工厂 `CommandFactory` 和 Lua 工厂 `RaftCommandFactory`，
+十一个命令同时注册到服务端工厂 `CommandFactory` 和 Lua 工厂 `RaftCommandFactory`，
 因此 `MULTI/EXEC` 与 `EVAL` 中同样可用。`XREVRANGE` / `XINFO` 属于第一批只读扩展，
-`XDEL` / `XTRIM` 属于第二批删除/裁剪扩展。
+`XDEL` / `XTRIM` 属于第二批删除/裁剪扩展，`XAUTOCLAIM` 属于第三批自动认领扩展。
 
 ### 2.1 与 Redis 语义对齐的细节
 
@@ -94,6 +96,23 @@
   `~`/`LIMIT`/引用策略；两者都不追加条目，因此 `changed_streams` 的 append 标志为
   false，阻塞中的 XREAD / XREADGROUP 不会被删除或裁剪唤醒，直到下一次 XADD。
 
+### 2.4 自动认领（第三批）
+
+- **XAUTOCLAIM**：支持 `min-idle-time`、`start`、`COUNT`（默认 100，必须为正）和
+  `JUSTID`。`start` 接受 `-`、`+`、裸毫秒和 `(id` 独占形式；独占 MAX 溢出时报
+  `ERR invalid start ID for the interval`。
+- **错误优先级**：Redis 先解析 idle/start/选项，再查 key 和 group；因此缺 key 时非法
+  参数仍然先报参数错误，只有参数合法才返回
+  `NOGROUP No such key '<key>' or consumer group '<group>'`。
+- **扫描语义**：从 `start` 起扫描 PEL，最多检查 `10 * COUNT` 条，已认领与已清理的
+  删除条目都计入 `COUNT`；游标 `next-start` 指向下一个未扫描的 PEL ID，扫描到末尾为
+  `0-0`。payload 已删除的 PEL 记录会被清理并放入回复第三项。
+- **确定性时间**：新增 `xautoclaim_at(..., now)`，认领后的 `delivery_ms`、消费者
+  `seen-time`/`active-time` 全部来自复制的写时钟；`JUSTID` 不增加投递次数。
+- 回复为 `[next-start, claimed, deleted-ids]`；`claimed` 非 `JUSTID` 时是
+  `[id, fields]`，`JUSTID` 时是 ID 数组。成功调用总会创建/触碰 consumer，因此会记录
+  一次 stream 快照增量。
+
 ## 3. 复制与快照
 
 ### 3.1 读写路径
@@ -110,7 +129,7 @@
 快照的状态，不能使用各节点自己的物理时钟。核心层因此新增带时钟参数的方法：
 
 - `RedisStream::xreadgroup_at(...)`、`xclaim_at(...)`、`xpending_range_at(...)`、
-  `xinfo_consumers_at(...)`、`xinfo_stream_full_at(...)`
+  `xinfo_consumers_at(...)`、`xinfo_stream_full_at(...)`、`xautoclaim_at(...)`
 - 协议层传入 `update.write_clock`；EXEC/Lua 内的读走 `execute_with_clock`，拿到同一个写时钟
 
 快照回放测试验证了：同一批操作在主节点与恢复节点上得到逐字节一致的 PEL。
@@ -196,11 +215,12 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
 ## 6. 测试与验证
 
 - 单元 + 集成测试：`cargo test -p cache_cat --lib -- --skip test::tests::test_add`
-  → **571 passed / 0 failed**（`test_add` 是需要本地 5001 节点的手工测试）。
-- 覆盖点：十个命令的参数/边界/错误文案、快照回放后的 PEL 一致性、generation 快照往返与
+  → **585 passed / 0 failed**（`test_add` 是需要本地 5001 节点的手工测试）。
+- 覆盖点：十一个命令的参数/边界/错误文案、快照回放后的 PEL 一致性、generation 快照往返与
   越界拒绝、过期 generation 被拒、单 group 单唤醒、多 group 各自唤醒、销毁后全部收到
   `NOGROUP`、非追加事件不扫描 XREAD、`XREVRANGE` 的 end/start 反转、`XINFO` 的
-  RESP2/RESP3 形状与逻辑时钟时间、`XDEL`/`XTRIM` 的快照增量重放与引用策略。
+  RESP2/RESP3 形状与逻辑时钟时间、`XDEL`/`XTRIM` 的快照增量重放与引用策略、
+  `XAUTOCLAIM` 的游标/COUNT/JUSTID/删除清理与确定性写时钟。
 - 真实单节点（debug 构建）验证：
   - `BLOCK 0` + `XGROUP DESTROY` → 立即收到 `NOGROUP`（不再永久挂起）；
   - 3 个阻塞消费者 + 一次 XADD → 只有 1 个被服务；下一次 XADD → 下一个；
@@ -213,13 +233,14 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
   - `XDEL` / `XTRIM` 的删除、裁剪、`LIMIT`、`KEEPREF`/`DELREF`/`ACKED`、`MULTI/EXEC`
     与 `EVAL` 均正确；阻塞中的 XREAD / XREADGROUP 不会被删除或裁剪唤醒，下一次 XADD
     才唤醒；
+  - `XAUTOCLAIM` 的游标翻页、`COUNT`、`JUSTID`、`min-idle-time`、删除条目清理、
+    错误优先级、`MULTI/EXEC` 与 `EVAL` 均正确；
   - 快照写入头部为 `MCDC\x02`，重启后数据、消费者组与 PEL 正常恢复。
 
 ## 7. 已知限制与后续方向
 
-- **Redis 8 其余 stream 命令**尚未暴露：`XAUTOCLAIM`、`XACKDEL`/`XDELEX`、`XSETID`。
-  core 均已实现，属协议层适配工作。建议顺序：先补 `xautoclaim_at` 后做
-  `XAUTOCLAIM`，最后 `XSETID` 与 Redis 8 的 `XACKDEL`/`XDELEX`。
+- **Redis 8 其余 stream 命令**尚未暴露：`XACKDEL`/`XDELEX`、`XSETID`。core 均已实现，
+  属协议层适配工作。
 - `DEL key` 不会唤醒阻塞客户端，与 Redis 的行为一致（DEL 不产生 stream 就绪信号）。
 - 阻塞的首次提交仍是一次 Raft 写（与 Redis 一致：空读也要创建/更新 consumer）。
 - 若等待期间 group 被销毁，客户端在收到 `NOGROUP` 时不会重试；这符合 Redis 语义。
@@ -229,6 +250,7 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
 ## 8. 提交列表
 
 ```
+36d809c add XAUTOCLAIM stream command
 e4c159d add XDEL and XTRIM stream commands
 91e8886 add XREVRANGE and XINFO stream commands
 db95a9f trim allocations on the stream wake path
