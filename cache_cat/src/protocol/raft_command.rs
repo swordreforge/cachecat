@@ -68,6 +68,7 @@ use crate::protocol::set::sunion::SUnionCommand;
 use crate::protocol::set::sunionstore::SUnionStoreCommand;
 use crate::protocol::stream::xack::XAckCommand;
 use crate::protocol::stream::xadd::XAddCommand;
+use crate::protocol::stream::xautoclaim::XAutoClaimCommand;
 use crate::protocol::stream::xclaim::XClaimCommand;
 use crate::protocol::stream::xdel::XDelCommand;
 use crate::protocol::stream::xgroup::XGroupCommand;
@@ -259,6 +260,7 @@ impl RaftCommandFactory {
         factory.register("XREADGROUP", XReadGroupCommand);
         factory.register("XPENDING", XPendingCommand);
         factory.register("XCLAIM", XClaimCommand);
+        factory.register("XAUTOCLAIM", XAutoClaimCommand);
         factory.register("XREVRANGE", XRevRangeCommand);
         factory.register("XINFO", XInfoCommand);
         factory.register("XDEL", XDelCommand);

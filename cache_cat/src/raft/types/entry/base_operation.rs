@@ -30,6 +30,7 @@ use crate::protocol::set::spop::SPopReq;
 use crate::protocol::set::srem::SRemReq;
 use crate::protocol::stream::xack::XAckReq;
 use crate::protocol::stream::xadd::XAddReq;
+use crate::protocol::stream::xautoclaim::XAutoClaimReq;
 use crate::protocol::stream::xclaim::XClaimReq;
 use crate::protocol::stream::xdel::XDelReq;
 use crate::protocol::stream::xgroup::XGroupReq;
@@ -117,6 +118,7 @@ pub enum BaseOperation {
     XClaim(XClaimReq),
     XDel(XDelReq),
     XTrim(XTrimReq),
+    XAutoClaim(XAutoClaimReq),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

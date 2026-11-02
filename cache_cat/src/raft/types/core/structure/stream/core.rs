@@ -878,6 +878,19 @@ impl RedisStream {
         consumer: &[u8],
         options: AutoClaimOptions,
     ) -> Result<AutoClaimReply> {
+        let now = self.clock.now_ms();
+        self.xautoclaim_at(name, consumer, options, now)
+    }
+
+    /// Replicated variant: `now` is the write clock, so delivery timestamps and
+    /// consumer activity are identical on every replica.
+    pub fn xautoclaim_at(
+        &mut self,
+        name: &[u8],
+        consumer: &[u8],
+        options: AutoClaimOptions,
+        now: u64,
+    ) -> Result<AutoClaimReply> {
         if options.count == 0 || options.count > (isize::MAX as usize) / 16 {
             return Err(StreamError::InvalidCount);
         }
@@ -885,7 +898,6 @@ impl RedisStream {
             .count
             .checked_mul(10)
             .ok_or(StreamError::InvalidCount)?;
-        let now = self.clock.now_ms();
         let group = self.groups.get_mut(name).ok_or(StreamError::NoGroup)?;
         group.touch(consumer, now);
         let keys = keys_in_range(

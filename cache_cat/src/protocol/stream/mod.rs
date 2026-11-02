@@ -7,6 +7,7 @@ use std::ops::Bound;
 
 pub mod xack;
 pub mod xadd;
+pub mod xautoclaim;
 pub mod xclaim;
 pub mod xdel;
 pub mod xgroup;
@@ -70,6 +71,23 @@ pub(super) fn parse_interval(
         Bound::Unbounded => StreamId::MAX,
     };
     Ok((start, end))
+}
+
+/// Parse a single interval start bound, including `-`, `+` and an exclusive
+/// `(id` form. XAUTOCLAIM uses this to position its PEL scan.
+pub(super) fn parse_interval_start(value: &Value) -> Result<StreamId, ProtocolError> {
+    let raw = value.as_str_lossy().ok_or_else(invalid_stream_id)?;
+    if matches!(raw.strip_prefix('('), Some("-" | "+")) {
+        return Err(invalid_stream_id());
+    }
+    let range = IdRange::parse(&raw, "+").map_err(|_| invalid_stream_id())?;
+    match range.start {
+        Bound::Included(id) => Ok(id),
+        Bound::Excluded(id) => id
+            .successor()
+            .ok_or_else(|| ProtocolError::response("ERR invalid start ID for the interval")),
+        Bound::Unbounded => Ok(StreamId::ZERO),
+    }
 }
 
 /// Parse the optional `COUNT n` suffix shared by XRANGE and XREVRANGE.

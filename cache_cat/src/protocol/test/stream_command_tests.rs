@@ -475,3 +475,93 @@ fn xdel_and_xtrim_base_operations_roundtrip_through_bincode() {
         ));
     }
 }
+
+fn seed_autoclaim(cache: &MyCache) {
+    apply(cache, request(&["XADD", "s", "1-0", "field", "one"]));
+    apply(cache, request(&["XADD", "s", "2-0", "field", "two"]));
+    apply(cache, request(&["XGROUP", "CREATE", "s", "g", "0"]));
+    apply(
+        cache,
+        request(&["XREADGROUP", "GROUP", "g", "old", "STREAMS", "s", ">"]),
+    );
+}
+
+#[test]
+fn xautoclaim_claims_pending_entries_and_replays_deterministically() {
+    let cache = MyCache::new(2).unwrap();
+    let restored = MyCache::new(2).unwrap();
+    seed_autoclaim(&cache);
+    seed_autoclaim(&restored);
+
+    let mut revision = 0;
+    let (reply, queue) = apply_snapshot(
+        &cache,
+        &["XAUTOCLAIM", "s", "g", "new", "0", "-", "COUNT", "1"],
+        &mut revision,
+    );
+    let Value::Array(Some(parts)) = reply else {
+        panic!("expected [next, claimed, deleted]");
+    };
+    assert_eq!(
+        parts[0].string_bytes_clone().as_deref(),
+        Some(b"2-0".as_slice())
+    );
+    assert!(matches!(&parts[1], Value::Array(Some(claimed)) if claimed.len() == 1));
+    assert!(matches!(&parts[2], Value::Array(Some(deleted)) if deleted.is_empty()));
+
+    replay(&restored, &queue);
+    let before = read(&cache, request(&["XPENDING", "s", "g"]));
+    let after = read(&restored, request(&["XPENDING", "s", "g"]));
+    assert_eq!(before.encode_proto(2), after.encode_proto(2));
+    assert_eq!(before.encode_proto(3), after.encode_proto(3));
+}
+
+#[test]
+fn xautoclaim_cleans_deleted_payloads_from_the_pel() {
+    let cache = MyCache::new(2).unwrap();
+    seed_autoclaim(&cache);
+    assert!(matches!(
+        apply(&cache, request(&["XDEL", "s", "1-0"])),
+        Value::Integer(1)
+    ));
+
+    let reply = apply(
+        &cache,
+        request(&["XAUTOCLAIM", "s", "g", "new", "0", "-", "JUSTID"]),
+    );
+    let Value::Array(Some(parts)) = reply else {
+        panic!("expected [next, claimed, deleted]");
+    };
+    let Value::Array(Some(deleted)) = &parts[2] else {
+        panic!("expected deleted ids");
+    };
+    assert_eq!(
+        deleted[0].string_bytes_clone().as_deref(),
+        Some(b"1-0".as_slice())
+    );
+    let Value::Array(Some(summary)) = read(&cache, request(&["XPENDING", "s", "g"])) else {
+        panic!("expected an XPENDING summary");
+    };
+    assert!(matches!(summary[0], Value::Integer(1)));
+}
+
+#[test]
+fn xautoclaim_base_operation_roundtrips_through_bincode() {
+    let operation = request(&[
+        "XAUTOCLAIM",
+        "s",
+        "g",
+        "c",
+        "500",
+        "(1-0",
+        "COUNT",
+        "5",
+        "JUSTID",
+    ]);
+    let encoded = bincode2::serialize(&Request::new(CLOCK, DB, operation)).unwrap();
+    let decoded: Request = bincode2::deserialize(&encoded).unwrap();
+    assert!(matches!(
+        decoded.operation,
+        Operation::Base(BaseOperation::XAutoClaim(_))
+    ));
+}

@@ -121,7 +121,8 @@ impl XClaimReq {
     }
 }
 
-fn reply(reply: ClaimReply) -> Value {
+/// Shared with XAUTOCLAIM, whose second reply element has the same shape.
+pub(super) fn claim_reply(reply: ClaimReply) -> Value {
     match reply {
         ClaimReply::Entries(entries) => Value::Array(Some(
             entries
@@ -187,7 +188,7 @@ impl ComputeCommand for XClaimReq {
                     },
                     expire,
                 },
-                reply(claimed),
+                claim_reply(claimed),
             ),
             Err(_) => (MochaOperation::Abort, no_group(&self.key, &self.group)),
         }

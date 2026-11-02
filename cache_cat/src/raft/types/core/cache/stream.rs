@@ -1,5 +1,6 @@
 use crate::error::ProtocolError;
 use crate::protocol::stream::xack::XAckReq;
+use crate::protocol::stream::xautoclaim::XAutoClaimReq;
 use crate::protocol::stream::xclaim::XClaimReq;
 use crate::protocol::stream::xdel::XDelReq;
 use crate::protocol::stream::xgroup::XGroupReq;
@@ -51,6 +52,11 @@ impl MyCache {
 
     /// XCLAIM moves PEL ownership and rewrites delivery metadata.
     pub fn x_claim(&self, param: XClaimReq, update: &mut Update) -> Value {
+        self.execute_compute(param, update)
+    }
+
+    /// XAUTOCLAIM scans the PEL and transfers all sufficiently idle entries.
+    pub fn x_autoclaim(&self, param: XAutoClaimReq, update: &mut Update) -> Value {
         self.execute_compute(param, update)
     }
 

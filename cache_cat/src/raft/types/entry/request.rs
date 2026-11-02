@@ -215,6 +215,7 @@ impl fmt::Display for Request {
                 BaseOperation::XAck(req) => write!(f, "XAck: {}", req),
                 BaseOperation::XReadGroup(req) => write!(f, "XReadGroup: {}", req),
                 BaseOperation::XClaim(req) => write!(f, "XClaim: {}", req),
+                BaseOperation::XAutoClaim(req) => write!(f, "XAutoClaim: {}", req),
                 BaseOperation::XDel(req) => write!(f, "XDel: {}", req),
                 BaseOperation::XTrim(req) => write!(f, "XTrim: {}", req),
             },
