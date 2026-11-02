@@ -74,13 +74,13 @@ fn read_request_inner<const REPLICATED: bool>(
             my_cache.execute_read_with_mode::<_, REPLICATED>(param, db_number, read_clock)
         }
         ReadOperation::SInter(param) => {
-            my_cache.execute_multi_read_with_mode::<_, REPLICATED>(param, db_number, read_clock)
+            my_cache.execute_multi_read_with_mode::<_, REPLICATED>(&param, db_number, read_clock)
         }
         ReadOperation::SUnion(param) => {
-            my_cache.execute_multi_read_with_mode::<_, REPLICATED>(param, db_number, read_clock)
+            my_cache.execute_multi_read_with_mode::<_, REPLICATED>(&param, db_number, read_clock)
         }
         ReadOperation::SDiff(param) => {
-            my_cache.execute_multi_read_with_mode::<_, REPLICATED>(param, db_number, read_clock)
+            my_cache.execute_multi_read_with_mode::<_, REPLICATED>(&param, db_number, read_clock)
         }
         ReadOperation::Keys(param) => {
             if REPLICATED {
@@ -308,11 +308,8 @@ pub fn do_request(
                         // XCLAIM and group reads must not pay for a scan.
                         StreamWaiter::Read(_) if !appended => None,
                         StreamWaiter::Read(params) => {
-                            let result = my_cache.execute_multi_read(
-                                params.clone(),
-                                key.0,
-                                update.write_clock,
-                            );
+                            let result =
+                                my_cache.execute_multi_read_ref(params, key.0, update.write_clock);
                             (!matches!(result, Value::Array(None))).then_some(result)
                         }
                         StreamWaiter::Group { group, identities } => {

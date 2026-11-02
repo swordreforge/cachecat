@@ -67,12 +67,23 @@ impl MyCache {
         db_number: u16,
         read_clock: u64,
     ) -> Value {
+        self.execute_multi_read_ref(&cmd, db_number, read_clock)
+    }
+
+    /// Same as `execute_multi_read` without taking ownership of the command.
+    /// The blocking dispatcher reuses one parsed request for every wake-up.
+    pub fn execute_multi_read_ref<C: MultiReadCommand>(
+        &self,
+        cmd: &C,
+        db_number: u16,
+        read_clock: u64,
+    ) -> Value {
         self.execute_multi_read_with_mode::<C, true>(cmd, db_number, read_clock)
     }
 
     pub(crate) fn execute_multi_read_with_mode<C: MultiReadCommand, const DETERMINISTIC: bool>(
         &self,
-        cmd: C,
+        cmd: &C,
         db_number: u16,
         read_clock: u64,
     ) -> Value {

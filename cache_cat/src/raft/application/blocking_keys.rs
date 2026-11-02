@@ -319,25 +319,38 @@ where
     /// Resolve a command's responses while the caller holds the global writer.
     /// Callbacks may read the cache directly, but must not reacquire that lock.
     pub fn wake_ready(&mut self, key: &K, mut resolve: impl FnMut(&C) -> Option<V>) -> usize {
-        let Some(ids) = self.keys.get(key).cloned() else {
+        // Take the key's queue out of the map so resolved waiters can be
+        // removed while iterating; only the ids that stay blocked are put back.
+        // This avoids cloning the whole tree on every event.
+        let Some(mut ids) = self.keys.remove(key) else {
             return 0;
         };
         let now = Instant::now();
         let mut notified = 0;
-        for id in ids {
+        let mut remaining = BTreeSet::new();
+        while let Some(id) = ids.pop_first() {
             let waiter = self.waiters.get(&id).expect("inconsistent waiter state");
             let result = if waiter.deadline.is_some_and(|deadline| now >= deadline) {
                 Some(Err(WaitError::Timeout))
             } else {
                 resolve(&waiter.context).map(|value| Ok((key.clone(), value)))
             };
-            if let Some(result) = result {
-                let waiter = self.remove_waiter(id).expect("inconsistent waiter state");
-                let ready = result.is_ok();
-                if waiter.tx.send(result).is_ok() && ready {
-                    notified += 1;
+            match result {
+                Some(result) => {
+                    // The queue is detached, so `remove_waiter` skips this key.
+                    let waiter = self.remove_waiter(id).expect("inconsistent waiter state");
+                    let ready = result.is_ok();
+                    if waiter.tx.send(result).is_ok() && ready {
+                        notified += 1;
+                    }
+                }
+                None => {
+                    remaining.insert(id);
                 }
             }
+        }
+        if !remaining.is_empty() {
+            self.keys.insert(key.clone(), remaining);
         }
         notified
     }
