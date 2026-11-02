@@ -172,6 +172,13 @@ Checked against `redis/8.0` `src/t_stream.c`:
   Group state is cached once per `(key, group)`, `wake_ready` takes the waiter queue out of the
   map instead of cloning it, and wake-ups use `execute_multi_read_ref` to avoid cloning
   `XReadParams`.
+- **DEL of a stream key** follows Redis' `unblock_on_nokey` rule: only XREADGROUP waiters
+  are marked, so deleting the stream answers `NOGROUP` immediately while a plain XREAD stays
+  blocked until the next `XADD`. Both single-key `BaseOperation::Del` and multi-key
+  `RedisDel` record a non-append `changed_streams` entry after removing a stream when a
+  client is blocked; the existing dispatcher then evaluates group waiters only. No event is
+  recorded without waiters, and snapshot replay keeps `effects = None`.
+  `UNLINK` and `SET` overwriting a stream are not wired into the same path yet.
 
 ## 5. Two existing defects fixed along the way
 
@@ -186,15 +193,16 @@ Checked against `redis/8.0` `src/t_stream.c`:
 
 ## 6. Verification
 
-- `cargo test -p cache_cat --lib -- --skip test::tests::test_add` → **617 passed / 0 failed**
+- `cargo test -p cache_cat --lib -- --skip test::tests::test_add` → **620 passed / 0 failed**
   (`test_add` needs a live node on port 5001).
 - Coverage includes argument/boundary/error text for all fourteen commands, PEL equality after
   snapshot replay, generation round-trips and rejection, one wake per group, per-group
   independent wakes, `NOGROUP` after destroy, no XREAD scans on non-append changes,
   XREVRANGE's end/start reversal, XINFO's RESP2/RESP3 shapes and clock-derived times,
   XDEL/XTRIM snapshot replay and reference policies, XAUTOCLAIM's cursor, COUNT, JUSTID,
-  PEL cleanup and deterministic write clock, XSETID's metadata validation, and
-  XACKDEL/XDELEX's status arrays and reference policies.
+  PEL cleanup and deterministic write clock, XSETID's metadata validation,
+  XACKDEL/XDELEX's status arrays and reference policies, and the different wake behaviour of
+  DEL for XREADGROUP versus plain XREAD.
 - Real single node: `BLOCK 0` plus `XGROUP DESTROY` answers `NOGROUP` immediately; one append
   serves one of three blocked consumers and the next append serves the next; destroying another
   group leaves the waiter asleep; destroy+recreate plus `XADD` answers `NOGROUP` with an empty
@@ -205,15 +213,17 @@ Checked against `redis/8.0` `src/t_stream.c`:
   XAUTOCLAIM pages with its cursor, honours COUNT/JUSTID/min-idle-time, cleans deleted PEL
   records and reports argument errors before NOGROUP; XSETID validates metadata and reports
   every error branch; XACKDEL/XDELEX return the correct status arrays for all reference
-  policies through MULTI/EXEC and EVAL; snapshots are written as `MCDC\x02` and restore data
-  and PEL after a restart.
+  policies through MULTI/EXEC and EVAL; DEL wakes a blocked XREADGROUP with NOGROUP while a
+  plain XREAD stays blocked until the next XADD, for single-key, multi-key and MULTI paths;
+  snapshots are written as `MCDC\x02` and restore data and PEL after a restart.
 
 ## 7. Known limits and next steps
 
 - **The Redis Stream command surface is complete**: `XLEN`, `XRANGE`, `XREVRANGE`, `XINFO`,
   `XACK`, `XACKDEL`, `XCLAIM`, `XAUTOCLAIM`, `XDEL`, `XDELEX`, `XTRIM`, `XSETID`, `XGROUP`,
   `XREAD`, `XREADGROUP` and `XADD` are all exposed.
-- `DEL key` does not wake blocked clients, matching Redis (DEL produces no stream readiness).
+- DEL now wakes blocked XREADGROUP waiters with `NOGROUP`; plain XREAD stays blocked until
+  the next XADD. `UNLINK` and `SET` overwriting a stream are not wired into the same path yet.
 - The first submit of a blocking read is still a Raft write; an empty read still creates or
   touches the consumer, as Redis does.
 - The server keeps using `Arc<RwLock<RedisStream>>`; the `SharedStream` notification stack is
@@ -222,6 +232,7 @@ Checked against `redis/8.0` `src/t_stream.c`:
 ## 8. Commits
 
 ```
+3c6666f wake blocked consumer groups when DEL removes a stream
 230c4bf add XSETID, XACKDEL and XDELEX stream commands
 36d809c add XAUTOCLAIM stream command
 e4c159d add XDEL and XTRIM stream commands
