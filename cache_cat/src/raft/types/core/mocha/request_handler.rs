@@ -297,16 +297,16 @@ pub fn do_request(
                 .waiters
                 .as_deref_mut()
                 .expect("effects require an execution guard");
-            for key in effects.changed_streams.drain() {
-                // New entries wake exactly one waiter per (key, group): the
-                // delivery is itself a replicated write that advances the
-                // cursor, and its own apply wakes the next waiter while
-                // entries remain. Destroys are answered with NOGROUP right
-                // here, so the error path costs no Raft write at all.
-                let mut woken_groups: Vec<Bytes> = Vec::new();
+            for (key, appended) in effects.changed_streams.drain() {
+                // Every waiter of the same group on this key shares one state
+                // read instead of repeating lookups and stream locks.
+                let mut groups: Vec<(Bytes, GroupState)> = Vec::new();
                 waiters
                     .blocking_keys
                     .wake_ready(&key, |waiter| match waiter {
+                        // Only an append can satisfy a blocked XREAD; XACK,
+                        // XCLAIM and group reads must not pay for a scan.
+                        StreamWaiter::Read(_) if !appended => None,
                         StreamWaiter::Read(params) => {
                             let result = my_cache.execute_multi_read(
                                 params.clone(),
@@ -316,17 +316,34 @@ pub fn do_request(
                             (!matches!(result, Value::Array(None))).then_some(result)
                         }
                         StreamWaiter::Group { group, identities } => {
-                            match group_waiter_status(my_cache, &key, group, identities) {
-                                GroupWake::Gone(error) => Some(error),
-                                GroupWake::Deliver => {
-                                    if woken_groups.iter().any(|woken| woken == group) {
-                                        None
-                                    } else {
-                                        woken_groups.push(group.clone());
-                                        Some(Value::ok())
+                            match group_state(&mut groups, my_cache, &key, group) {
+                                GroupState::Missing => Some(no_group_read(&key.1, group)),
+                                GroupState::WrongType => Some(ProtocolError::WrongType.into()),
+                                GroupState::Live {
+                                    identity,
+                                    has_new,
+                                    woken,
+                                } => {
+                                    let expected = identities
+                                        .iter()
+                                        .find(|(waited, _)| waited == &key)
+                                        .map(|(_, identity)| identity);
+                                    match expected {
+                                        // This waiter captured a group that was
+                                        // destroyed or recreated: answer NOGROUP
+                                        // without spending a Raft write.
+                                        Some(expected) if !Arc::ptr_eq(expected, identity) => {
+                                            Some(no_group_read(&key.1, group))
+                                        }
+                                        // New entries wake one waiter per group;
+                                        // its delivery write wakes the next one.
+                                        Some(_) if *has_new && !*woken => {
+                                            *woken = true;
+                                            Some(Value::ok())
+                                        }
+                                        _ => None,
                                     }
                                 }
-                                GroupWake::Retain => None,
                             }
                         }
                     });
@@ -337,48 +354,52 @@ pub fn do_request(
     result
 }
 
-/// Outcome of evaluating one blocked XREADGROUP against a stream change.
-enum GroupWake {
-    /// The group is gone or was recreated: answer NOGROUP without a write.
-    Gone(Value),
-    /// New entries exist: wake one waiter per (key, group).
-    Deliver,
-    /// Nothing deliverable for this waiter.
-    Retain,
+/// One cached view of a (key, group) pair, built once per changed key.
+enum GroupState {
+    /// No such key or group.
+    Missing,
+    /// The key exists but holds another type.
+    WrongType,
+    /// The group is alive. `woken` enforces one delivery per group per event.
+    Live {
+        identity: Arc<()>,
+        has_new: bool,
+        woken: bool,
+    },
 }
 
-/// Decide whether a stream change matters to a blocked XREADGROUP. New entries
-/// wake it, and so do a destroyed or recreated group: the latter is answered
-/// immediately with NOGROUP instead of submitting a doomed group read.
-fn group_waiter_status(
+/// Return the shared state for `group`, computing it once per changed key.
+fn group_state<'a>(
+    groups: &'a mut Vec<(Bytes, GroupState)>,
     my_cache: &MyCache,
     key: &(u16, Bytes),
     group: &Bytes,
-    identities: &[((u16, Bytes), Arc<()>)],
-) -> GroupWake {
+) -> &'a mut GroupState {
+    if let Some(index) = groups.iter().position(|(name, _)| name == group) {
+        return &mut groups[index].1;
+    }
+    groups.push((group.clone(), inspect_group(my_cache, key, group)));
+    &mut groups.last_mut().expect("just pushed a group state").1
+}
+
+fn inspect_group(my_cache: &MyCache, key: &(u16, Bytes), group: &[u8]) -> GroupState {
     let Some(database) = my_cache.databases.get(key.0 as usize) else {
-        return GroupWake::Retain;
+        return GroupState::Missing;
     };
     let Some(entry) = database.mocha.get_entry(&key.1) else {
-        return GroupWake::Gone(no_group_read(&key.1, group));
+        return GroupState::Missing;
     };
     let ValueObject::Stream(stream) = &entry.value.data else {
-        return GroupWake::Gone(ProtocolError::WrongType.into());
+        return GroupState::WrongType;
     };
     let stream = stream.read();
-    let Ok(current) = stream.group_identity(group) else {
-        return GroupWake::Gone(no_group_read(&key.1, group));
-    };
-    let Some((_, expected)) = identities.iter().find(|(waited, _)| waited == key) else {
-        return GroupWake::Retain;
-    };
-    if !Arc::ptr_eq(expected, &current) {
-        return GroupWake::Gone(no_group_read(&key.1, group));
-    }
-    if stream.group_has_new(group).unwrap_or(false) {
-        GroupWake::Deliver
-    } else {
-        GroupWake::Retain
+    match stream.group_identity(group) {
+        Ok(identity) => GroupState::Live {
+            identity,
+            has_new: stream.group_has_new(group).unwrap_or(false),
+            woken: false,
+        },
+        Err(_) => GroupState::Missing,
     }
 }
 
@@ -1086,8 +1107,8 @@ mod tests {
         let group = Bytes::from_static(b"g");
         let identities = group_identities(&cache, &key, b"g");
         assert!(matches!(
-            group_waiter_status(&cache, &(0, key.clone()), &group, &identities),
-            GroupWake::Retain
+            inspect_group(&cache, &(0, key.clone()), b"g"),
+            GroupState::Live { has_new: false, .. }
         ));
 
         let waiter = cache
@@ -1194,10 +1215,15 @@ mod tests {
             4,
         )
         .await;
-        assert!(matches!(
-            group_waiter_status(&cache, &(0, key.clone()), &group, &identities),
-            GroupWake::Gone(_)
-        ));
+        match inspect_group(&cache, &(0, key.clone()), b"g") {
+            GroupState::Live { identity, .. } => {
+                assert!(
+                    !Arc::ptr_eq(&identities[0].1, &identity),
+                    "a recreated group must have a new identity"
+                );
+            }
+            _ => panic!("recreated group must be live"),
+        }
     }
 
     async fn group_waiter(
@@ -1369,5 +1395,121 @@ mod tests {
             assert!(matches!(payload, Value::Error(ref error) if error.starts_with("NOGROUP")));
         }
         drop(survivor_waiter);
+    }
+
+    #[tokio::test]
+    async fn non_append_changes_do_not_scan_xread_waiters() {
+        use futures::FutureExt;
+
+        let cache = MyCache::new(2).unwrap();
+        let key = Bytes::from_static(b"stream");
+        apply(&cache, xadd(&key, AddId::Auto), 0, 1).await;
+        apply(
+            &cache,
+            Operation::Base(BaseOperation::XGroup(
+                crate::protocol::stream::xgroup::XGroupReq::Create {
+                    key: key.clone(),
+                    group: Bytes::from_static(b"g"),
+                    id: crate::raft::types::core::structure::stream::GroupStart::Last,
+                    entries_read: None,
+                    mkstream: false,
+                },
+            )),
+            0,
+            2,
+        )
+        .await;
+        // FORCE records a PEL entry so a later XACK is a real stream write.
+        apply(
+            &cache,
+            Operation::Base(BaseOperation::XClaim(
+                crate::protocol::stream::xclaim::XClaimReq {
+                    key: key.clone(),
+                    group: Bytes::from_static(b"g"),
+                    consumer: Bytes::from_static(b"c"),
+                    ids: vec![StreamId::new(1, 0)],
+                    options: crate::raft::types::core::structure::stream::ClaimOptions {
+                        force: true,
+                        ..Default::default()
+                    },
+                },
+            )),
+            0,
+            3,
+        )
+        .await;
+
+        // A reader whose cursor predates the existing entry would be served by
+        // any evaluation, so it exposes whether non-append changes scan XREAD.
+        let reader = cache
+            .write_lock
+            .lock()
+            .await
+            .register_stream(
+                vec![(0, key.clone())],
+                None,
+                StreamWaiter::Read(read_params(&key)),
+            )
+            .unwrap();
+
+        let mut effects = ApplyEffects::default();
+        apply_with_effects(
+            &cache,
+            Operation::Base(BaseOperation::XAck(
+                crate::protocol::stream::xack::XAckReq {
+                    key: key.clone(),
+                    group: Bytes::from_static(b"g"),
+                    ids: vec![Bytes::from_static(b"1-0")],
+                },
+            )),
+            0,
+            4,
+            &mut effects,
+        )
+        .await;
+        assert_eq!(
+            cache.write_lock.lock().await.blocking_keys.waiter_count(),
+            1,
+            "an XACK must not evaluate (and therefore wake) blocked XREAD readers"
+        );
+
+        // An append still serves it.
+        let mut effects = ApplyEffects::default();
+        apply_with_effects(&cache, xadd(&key, AddId::Auto), 0, 5, &mut effects).await;
+        let (_, reply) = reader
+            .wait()
+            .now_or_never()
+            .expect("append wakes it")
+            .unwrap();
+        assert!(matches!(reply, Value::MapWithResp2 { .. }));
+    }
+
+    #[tokio::test]
+    async fn stale_and_fresh_waiters_of_one_group_get_different_answers() {
+        use futures::FutureExt;
+
+        let cache = MyCache::new(2).unwrap();
+        let key = Bytes::from_static(b"stream");
+        seed_group_at_tail(&cache, &key).await;
+        let group = Bytes::from_static(b"g");
+        let current = group_identities(&cache, &key, b"g");
+        // Models a waiter that registered before the group was recreated.
+        let mut stale = current.clone();
+        stale[0].1 = Arc::new(());
+
+        let old = group_waiter(&cache, &key, &group, &stale).await;
+        let new = group_waiter(&cache, &key, &group, &current).await;
+
+        let mut effects = ApplyEffects::default();
+        apply_with_effects(&cache, xadd(&key, AddId::Auto), 0, 3, &mut effects).await;
+        assert_eq!(
+            cache.write_lock.lock().await.blocking_keys.waiter_count(),
+            0
+        );
+
+        let (_, old_payload) = old.wait().now_or_never().unwrap().unwrap();
+        assert!(matches!(old_payload, Value::Error(ref error) if error.starts_with("NOGROUP")));
+        let (_, new_payload) = new.wait().now_or_never().unwrap().unwrap();
+        assert!(matches!(new_payload, Value::SimpleString(_)));
     }
 }

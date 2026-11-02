@@ -246,6 +246,12 @@ impl RedisStream {
     pub fn last_generated_id(&self) -> StreamId {
         self.last_generated_id
     }
+
+    /// Number of entries ever added. Only XADD grows it, which is how the apply
+    /// path tells an append from a group/PEL-only change.
+    pub fn entries_added(&self) -> u64 {
+        self.entries_added
+    }
     pub fn contains(&self, id: StreamId) -> bool {
         self.entries.contains_key(&id.to_key())
     }

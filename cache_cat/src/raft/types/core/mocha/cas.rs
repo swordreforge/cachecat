@@ -141,6 +141,25 @@ impl MyCache {
 
         let snapshotting = matches!(update.update_type, UpdateType::Snapshot { .. });
         let recorded_cmd = snapshotting.then(|| cmd.clone());
+        // Only blocked clients care about the change kind, so the extra read is
+        // skipped unless somebody is waiting.
+        let notify_waiters = update.effects.is_some()
+            && !matches!(update.update_type, UpdateType::CAS { .. })
+            && update
+                .waiters
+                .as_deref()
+                .is_some_and(|waiters| !waiters.blocking_keys.is_empty());
+        // XADD is the only stream command that grows `entries_added`. Comparing
+        // it around the mutation stays correct if a future command appends,
+        // unlike a per-command flag someone could forget to set.
+        let pre_entries_added = if notify_waiters {
+            entry.as_ref().and_then(|entry| match &entry.value.data {
+                ValueObject::Stream(stream) => Some(stream.read().entries_added()),
+                _ => None,
+            })
+        } else {
+            None
+        };
         let (changed, response) = match entry {
             Some(mut entry) => {
                 if snapshotting {
@@ -167,16 +186,26 @@ impl MyCache {
         // One generic event covers every stream write: XADD, XGROUP, XACK,
         // XCLAIM and XREADGROUP all rewrite a stream value. Waiters re-evaluate
         // on wake, so no command has to remember to publish its own event.
-        let notify_key = (matches!(
-            &changed,
-            MochaOperation::Insert { value, .. }
-                if matches!(&value.data, ValueObject::Stream(_))
-        ) && !matches!(update.update_type, UpdateType::CAS { .. })
-            && update
-                .waiters
-                .as_deref()
-                .is_some_and(|waiters| !waiters.blocking_keys.is_empty()))
+        let notify_key = (notify_waiters
+            && matches!(
+                &changed,
+                MochaOperation::Insert { value, .. }
+                    if matches!(&value.data, ValueObject::Stream(_))
+            ))
         .then(|| (update.db_number, key.clone()));
+        let appended = notify_key.is_some()
+            && match &changed {
+                MochaOperation::Insert { value, .. } => match &value.data {
+                    ValueObject::Stream(stream) => {
+                        let post = stream.read().entries_added();
+                        // A key created by this write only counts as an append
+                        // when entries were actually added (XADD, not MKSTREAM).
+                        pre_entries_added.map_or(post > 0, |pre| post > pre)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
         match changed {
             MochaOperation::Insert { mut value, expire } => {
                 value.version = revision;
@@ -199,7 +228,7 @@ impl MyCache {
             });
         }
         if let (Some(key), Some(effects)) = (notify_key, update.effects.as_deref_mut()) {
-            effects.changed_streams.insert(key);
+            *effects.changed_streams.entry(key).or_insert(false) |= appended;
         }
         response
     }

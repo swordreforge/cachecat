@@ -13,7 +13,7 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::cmp::max;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::option::Option;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -286,20 +286,20 @@ impl MyCache {
 /// EXEC/Lua publish only their final state. Empty sets allocate no buckets.
 #[derive(Debug, Default)]
 pub struct ApplyEffects {
-    /// Keys whose stream value changed during this apply batch. Appends, group
-    /// creation/destruction, cursor moves and PEL updates all land here; the
-    /// per-waiter predicate decides whether the change is deliverable, so no
-    /// command-specific wake-up bookkeeping is required.
-    pub(crate) changed_streams: HashSet<(u16, Bytes)>,
+    /// Keys whose stream value changed during this apply batch, mapped to
+    /// whether entries were appended. Only an append can satisfy a blocked
+    /// XREAD, while group waiters re-check any change, so the flag lets the
+    /// dispatcher skip pointless XREAD evaluations on XACK/XCLAIM writes.
+    pub(crate) changed_streams: HashMap<(u16, Bytes), bool>,
 }
 
 impl ApplyEffects {
     /// Reuse small tables without retaining a large transaction's buckets.
     /// Called only after a nonempty notification set has been processed.
-    pub(crate) fn recycle_changed_keys(keys: &mut HashSet<(u16, Bytes)>) {
+    pub(crate) fn recycle_changed_keys(keys: &mut HashMap<(u16, Bytes), bool>) {
         debug_assert!(keys.is_empty());
         if keys.capacity() > 64 {
-            *keys = HashSet::new();
+            *keys = HashMap::new();
         }
     }
 }
