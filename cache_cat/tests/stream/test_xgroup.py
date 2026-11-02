@@ -6,8 +6,8 @@ Run against a cache-cat instance listening on localhost:6379::
 
 The tests intentionally use ``execute_command`` for XGROUP subcommands so
 their assertions cover the wire-level replies produced by cache-cat. Commands
-outside the XGROUP scope (such as XINFO and XPENDING) are avoided
-so this smoke test can run while those command families are developed.
+outside the XGROUP scope (such as XINFO and XPENDING) have their own Rust
+unit and integration coverage.
 """
 
 import unittest

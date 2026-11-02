@@ -15,6 +15,8 @@
 1. 补齐 `XLEN`、`XRANGE`、`XACK`、`XREADGROUP`、`XPENDING`、`XCLAIM` 六个命令；
 2. 把阻塞唤醒从"只有追加才有事件"重构成"任意 stream 写入产生通用变更事件 + 等待者自检"。
 
+之后又完成了第一批只读扩展，补齐 `XREVRANGE` 与 `XINFO`（见 2.2）。
+
 ## 2. 新增命令
 
 | 命令 | trait | 复制载荷 | 说明 |
@@ -25,9 +27,11 @@
 | `XACK` | `ComputeCommand` | `BaseOperation::XAck` | 单键读改写，清 PEL |
 | `XCLAIM` | `ComputeCommand` | `BaseOperation::XClaim` | 单键读改写，转移归属 |
 | `XREADGROUP` | 多键读写 | `RedisOperation::RedisXReadGroup` + 每键 `BaseOperation::XReadGroup` | 原子多键，快照按单键记录 |
+| `XREVRANGE` | `ReadCommand` | `ReadOperation::XRevRange` | 单键读，反向区间 + `COUNT` |
+| `XINFO` | `ReadCommand` | `ReadOperation::XInfo` | `STREAM` / `GROUPS` / `CONSUMERS` / `HELP` |
 
-六个命令同时注册到服务端工厂 `CommandFactory` 和 Lua 工厂 `RaftCommandFactory`，
-因此 `MULTI/EXEC` 与 `EVAL` 中同样可用。
+八个命令同时注册到服务端工厂 `CommandFactory` 和 Lua 工厂 `RaftCommandFactory`，
+因此 `MULTI/EXEC` 与 `EVAL` 中同样可用。`XREVRANGE` / `XINFO` 属于后续第一批只读扩展。
 
 ### 2.1 与 Redis 语义对齐的细节
 
@@ -48,6 +52,25 @@
 - **XCLAIM**：`min-idle-time`、`IDLE`、`TIME`、`RETRYCOUNT`、`FORCE`、`JUSTID`、`LASTID`
   全部支持，ID 与选项可交错出现；`JUSTID` 只返回 ID。
 
+### 2.2 只读扩展（第一批）
+
+- **XREVRANGE**：线上参数顺序是 `end start`，解析时先反转为与 `XRANGE` 相同的
+  闭区间 `[start, end]` 再复制；`COUNT` 规则与 `XRANGE` 完全一致（重复取最后一个、
+  负数按 0、key 存在时 `COUNT 0` 返回 null array、缺 key 返回空数组）。
+  `COUNT` 解析已抽成 `parse_count_option` 供两个命令共用。
+- **XINFO**：`STREAM [FULL [COUNT n]]`、`GROUPS`、`CONSUMERS`、`HELP` 全部支持。
+  缺 key 统一返回 `ERR no such key`（与 Redis 一致，而不是 NOGROUP）；
+  `CONSUMERS` 缺 group 返回
+  `NOGROUP No such consumer group '<group>' for key name '<key>'`。
+  RESP2 使用 Redis 的扁平 field/value 数组，RESP3 使用 map。
+- **确定性时间**：`XINFO CONSUMERS` 的 `idle`/`inactive` 和 `STREAM FULL` 里的
+  `seen-time`/`active-time` 都使用本次读取的逻辑时钟（新增
+  `xinfo_consumers_at`、`xinfo_stream_full_at`），因此各副本结果一致。
+  `FULL` 默认 `COUNT 10`、`COUNT 0` 为不限、负数额按默认 10，与 Redis 相同。
+- **字段取舍**：cache-cat 用 B 树而不是 radix tree 存储条目，所以不输出 Redis 内部的
+  `radix-tree-keys` / `radix-tree-nodes`，其余字段（长度、首尾条目、组、PEL、
+  消费者时间等）均按 Redis 语义输出。
+
 ## 3. 复制与快照
 
 ### 3.1 读写路径
@@ -63,7 +86,8 @@
 消费组状态（PEL 的 `delivery_ms`、consumer 活跃时间、XPENDING 的 idle）都属于会被复制和
 快照的状态，不能使用各节点自己的物理时钟。核心层因此新增带时钟参数的方法：
 
-- `RedisStream::xreadgroup_at(...)`、`xclaim_at(...)`、`xpending_range_at(...)`
+- `RedisStream::xreadgroup_at(...)`、`xclaim_at(...)`、`xpending_range_at(...)`、
+  `xinfo_consumers_at(...)`、`xinfo_stream_full_at(...)`
 - 协议层传入 `update.write_clock`；EXEC/Lua 内的读走 `execute_with_clock`，拿到同一个写时钟
 
 快照回放测试验证了：同一批操作在主节点与恢复节点上得到逐字节一致的 PEL。
@@ -149,10 +173,11 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
 ## 6. 测试与验证
 
 - 单元 + 集成测试：`cargo test -p cache_cat --lib -- --skip test::tests::test_add`
-  → **529 passed / 0 failed**（`test_add` 是需要本地 5001 节点的手工测试）。
-- 覆盖点：六个命令的参数/边界/错误文案、快照回放后的 PEL 一致性、generation 快照往返与
+  → **550 passed / 0 failed**（`test_add` 是需要本地 5001 节点的手工测试）。
+- 覆盖点：八个命令的参数/边界/错误文案、快照回放后的 PEL 一致性、generation 快照往返与
   越界拒绝、过期 generation 被拒、单 group 单唤醒、多 group 各自唤醒、销毁后全部收到
-  `NOGROUP`、非追加事件不扫描 XREAD。
+  `NOGROUP`、非追加事件不扫描 XREAD、`XREVRANGE` 的 end/start 反转、`XINFO` 的
+  RESP2/RESP3 形状与逻辑时钟时间。
 - 真实单节点（debug 构建）验证：
   - `BLOCK 0` + `XGROUP DESTROY` → 立即收到 `NOGROUP`（不再永久挂起）；
   - 3 个阻塞消费者 + 一次 XADD → 只有 1 个被服务；下一次 XADD → 下一个；
@@ -160,12 +185,16 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
   - 阻塞期间销毁并重建 + XADD → 返回 `NOGROUP`，新 group 的 PEL 保持为空；
   - `EVAL` 内连续两次 XADD（单条日志）→ 两个消费者通过链式唤醒各拿一条；
   - `XACK` 不唤醒阻塞的 XREAD，`XADD` 才唤醒；
+  - `XREVRANGE` 反向返回、`COUNT` 与缺 key 行为正确；`XINFO` 的 RESP2 扁平数组与
+    RESP3 map、`HELP`、`NOGROUP` 文案、`MULTI/EXEC` 入队与 `EVAL` 调用均正确；
   - 快照写入头部为 `MCDC\x02`，重启后数据、消费者组与 PEL 正常恢复。
 
 ## 7. 已知限制与后续方向
 
 - **Redis 8 其余 stream 命令**尚未暴露：`XAUTOCLAIM`、`XACKDEL`/`XDELEX`、`XTRIM`、
-  `XDEL`、`XINFO`、`XREVRANGE`、`XSETID`。core 大多已实现，属协议层适配工作。
+  `XDEL`、`XSETID`。core 均已实现，属协议层适配工作。建议顺序：先 `XDEL`/`XTRIM`，
+  再补 `xautoclaim_at` 后做 `XAUTOCLAIM`，最后 `XSETID` 与 Redis 8 的
+  `XACKDEL`/`XDELEX`。
 - `DEL key` 不会唤醒阻塞客户端，与 Redis 的行为一致（DEL 不产生 stream 就绪信号）。
 - 阻塞的首次提交仍是一次 Raft 写（与 Redis 一致：空读也要创建/更新 consumer）。
 - 若等待期间 group 被销毁，客户端在收到 `NOGROUP` 时不会重试；这符合 Redis 语义。
@@ -175,6 +204,7 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
 ## 8. 提交列表
 
 ```
+91e8886 add XREVRANGE and XINFO stream commands
 db95a9f trim allocations on the stream wake path
 c4ecf53 skip useless XREAD scans on non-append stream changes
 efce599 avoid needless Raft writes on stream wakeups

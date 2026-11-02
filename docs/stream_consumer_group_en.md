@@ -17,6 +17,8 @@ The work has two parts:
 2. turn blocking wake-ups into "any stream write publishes a generic change event and each
    waiter re-checks its own state".
 
+A follow-up batch then added the read-only `XREVRANGE` and `XINFO` (section 2.2).
+
 ## 2. Commands
 
 | Command | trait | replicated payload | notes |
@@ -27,9 +29,11 @@ The work has two parts:
 | `XACK` | `ComputeCommand` | `BaseOperation::XAck` | clears PEL entries |
 | `XCLAIM` | `ComputeCommand` | `BaseOperation::XClaim` | moves PEL ownership |
 | `XREADGROUP` | multi-key write | `RedisOperation::RedisXReadGroup` + per-key `BaseOperation::XReadGroup` | atomic across keys, snapshots record single-key deltas |
+| `XREVRANGE` | `ReadCommand` | `ReadOperation::XRevRange` | reverse interval plus `COUNT` |
+| `XINFO` | `ReadCommand` | `ReadOperation::XInfo` | `STREAM` / `GROUPS` / `CONSUMERS` / `HELP` |
 
-All six are registered in both the server factory and the Lua factory, so they work inside
-`MULTI/EXEC` and `EVAL`.
+All eight are registered in both the server factory and the Lua factory, so they work inside
+`MULTI/EXEC` and `EVAL`; the last two arrived in the follow-up read-only batch.
 
 ### 2.1 Redis-compatible details
 
@@ -51,14 +55,33 @@ Checked against `redis/8.0` `src/t_stream.c`:
 - **XCLAIM**: `min-idle-time`, `IDLE`, `TIME`, `RETRYCOUNT`, `FORCE`, `JUSTID`, `LASTID`;
   IDs and options may be interleaved; `JUSTID` returns ids only.
 
+### 2.2 Read-only follow-up
+
+- **XREVRANGE**: the wire order is `end start`; the parser normalizes it into the same
+  inclusive low/high bounds as XRANGE before replication. `COUNT` follows the XRANGE rules
+  exactly (last wins, negatives clamp to zero, `COUNT 0` is a null array when the key exists,
+  a missing key is an empty array). The COUNT parser is shared by both commands.
+- **XINFO**: `STREAM [FULL [COUNT n]]`, `GROUPS`, `CONSUMERS` and `HELP`. A missing key is
+  `ERR no such key` (not NOGROUP); a missing group in `CONSUMERS` is
+  `NOGROUP No such consumer group '<group>' for key name '<key>'`. RESP2 uses Redis' flat
+  field/value arrays and RESP3 uses maps.
+- **Deterministic times**: `idle`/`inactive` and the FULL form's `seen-time`/`active-time`
+  use the read's logical clock through new `xinfo_consumers_at` and `xinfo_stream_full_at`
+  variants, so replicas agree. `FULL` defaults to `COUNT 10`, `COUNT 0` is unlimited and a
+  negative count falls back to 10, as in Redis.
+- **Field choice**: cache-cat stores entries in a B-tree rather than a radix tree, so the
+  internal `radix-tree-keys`/`radix-tree-nodes` fields are omitted; every other field is
+  reported with Redis semantics.
+
 ## 3. Replication and snapshots
 
 - Reads go through `ReadOperation`; single-key writes through `BaseOperation` and
   `execute_compute` (which also serves CAS snapshot replay); multi-key `XREADGROUP` is one
   `RedisOperation` log entry whose per-key work records single-key operations for snapshots.
 - Delivery timestamps, consumer activity and XPENDING idle times are replicated state, so the
-  core exposes clock-parameterised variants (`xreadgroup_at`, `xclaim_at`,
-  `xpending_range_at`) fed by `update.write_clock`. A replay test confirms identical PEL state.
+  core exposes clock-parameterised variants (`xreadgroup_at`, `xclaim_at`, `xpending_range_at`,
+  `xinfo_consumers_at`, `xinfo_stream_full_at`) fed by `update.write_clock`. A replay test
+  confirms identical PEL state.
 - **Group generations** (stream snapshot version 4): `Group::generation` is assigned from a
   replicated monotonic counter on `XGROUP CREATE`, persisted in the stream snapshot, captured
   by a blocked `XREADGROUP` before its first submit and validated in the apply path. A client
@@ -94,19 +117,26 @@ Checked against `redis/8.0` `src/t_stream.c`:
 
 ## 6. Verification
 
-- `cargo test -p cache_cat --lib -- --skip test::tests::test_add` → **529 passed / 0 failed**
+- `cargo test -p cache_cat --lib -- --skip test::tests::test_add` → **550 passed / 0 failed**
   (`test_add` needs a live node on port 5001).
+- Coverage includes argument/boundary/error text for all eight commands, PEL equality after
+  snapshot replay, generation round-trips and rejection, one wake per group, per-group
+  independent wakes, `NOGROUP` after destroy, no XREAD scans on non-append changes,
+  XREVRANGE's end/start reversal, and XINFO's RESP2/RESP3 shapes and clock-derived times.
 - Real single node: `BLOCK 0` plus `XGROUP DESTROY` answers `NOGROUP` immediately; one append
   serves one of three blocked consumers and the next append serves the next; destroying another
   group leaves the waiter asleep; destroy+recreate plus `XADD` answers `NOGROUP` with an empty
   new PEL; two entries written in one `EVAL` are delivered through chained wake-ups; an `XACK`
-  no longer wakes a blocked `XREAD`; snapshots are written as `MCDC\x02` and restore data and
-  PEL after a restart.
+  no longer wakes a blocked `XREAD`; XREVRANGE and XINFO (RESP2/RESP3, HELP, NOGROUP,
+  MULTI/EXEC and EVAL) behave correctly; snapshots are written as `MCDC\x02` and restore data
+  and PEL after a restart.
 
 ## 7. Known limits and next steps
 
 - Remaining stream commands are not exposed yet: `XAUTOCLAIM`, `XACKDEL`/`XDELEX`, `XTRIM`,
-  `XDEL`, `XINFO`, `XREVRANGE`, `XSETID`. Most already exist in the core.
+  `XDEL` and `XSETID`. All exist in the core; the suggested order is `XDEL`/`XTRIM` first,
+  then `XAUTOCLAIM` after adding `xautoclaim_at`, and finally `XSETID` plus the Redis 8
+  `XACKDEL`/`XDELEX`.
 - `DEL key` does not wake blocked clients, matching Redis (DEL produces no stream readiness).
 - The first submit of a blocking read is still a Raft write; an empty read still creates or
   touches the consumer, as Redis does.
@@ -116,6 +146,7 @@ Checked against `redis/8.0` `src/t_stream.c`:
 ## 8. Commits
 
 ```
+91e8886 add XREVRANGE and XINFO stream commands
 db95a9f trim allocations on the stream wake path
 c4ecf53 skip useless XREAD scans on non-append stream changes
 efce599 avoid needless Raft writes on stream wakeups
