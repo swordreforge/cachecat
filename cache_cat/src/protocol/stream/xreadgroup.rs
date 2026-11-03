@@ -366,17 +366,19 @@ impl XReadGroupParams {
     ///
     /// Also reports whether the request has something to return immediately:
     /// a history read always does, and a `>` read does when the group cursor is
-    /// behind the stream. When nothing is ready the caller can register a
-    /// waiter without spending a Raft write just to create/touch a consumer.
+    /// behind the stream. `consumer_missing` lets the caller keep Redis'
+    /// create/touch write when this consumer is new while avoiding it for an
+    /// already-known consumer.
     fn capture(
         &self,
         cache: &MyCache,
         db: u16,
-    ) -> Result<(Vec<((u16, Bytes), Arc<()>)>, Vec<Option<u64>>, bool), Value> {
+    ) -> Result<(Vec<((u16, Bytes), Arc<()>)>, Vec<Option<u64>>, bool, bool), Value> {
         let database = cache.get_cache(db)?;
         let mut identities = Vec::with_capacity(self.request.keys.len());
         let mut generations = Vec::with_capacity(self.request.keys.len());
         let mut immediate = false;
+        let mut consumer_missing = false;
         for (index, key) in self.request.keys.iter().enumerate() {
             let Some(entry) = database.mocha.get_entry(key) else {
                 return Err(no_group_read(key, &self.request.group));
@@ -398,15 +400,18 @@ impl XReadGroupParams {
             {
                 immediate = true;
             }
+            if !stream.has_consumer(&self.request.group, &self.request.consumer) {
+                consumer_missing = true;
+            }
             identities.push(((db, key.clone()), identity));
             generations.push(Some(generation));
         }
-        Ok((identities, generations, immediate))
+        Ok((identities, generations, immediate, consumer_missing))
     }
 
     async fn read(mut self, app: &CacheCatApp, db: u16) -> Result<Value, CacheCatError> {
         let cache = &app.state_machine.data.kvs;
-        let (identities, generations, immediate) = {
+        let (identities, generations, immediate, consumer_missing) = {
             let _write = cache.write_lock.lock().await;
             let _read = cache.read_lock.read();
             match self.capture(cache, db) {
@@ -419,11 +424,10 @@ impl XReadGroupParams {
             return self.submit(app, db).await;
         };
         // Redis creates/touches the consumer before blocking, but that is a
-        // replicated write. When nothing is ready and every stream uses `>`,
-        // register the waiter first and submit only after an XADD wakes it.
-        // The consumer then appears on the first real read rather than while
-        // the client is idle.
-        let defer_initial_read = !immediate && self.blocks_on_new();
+        // replicated write. Keep the write when this consumer is new so it is
+        // visible while blocked; when every group already knows it and nothing
+        // is ready, register the waiter first and submit only after an XADD.
+        let defer_initial_read = !immediate && self.blocks_on_new() && !consumer_missing;
         if !defer_initial_read {
             let result = self.submit(app, db).await?;
             if !matches!(result, Value::Array(None)) || !self.blocks_on_new() {
@@ -575,7 +579,11 @@ impl Command for XReadGroupCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::types::core::structure::stream::StreamId;
+    use crate::raft::types::core::mocha::core::{MyCache, MyValue};
+    use crate::raft::types::core::structure::stream::{AddId, GroupStart, RedisStream, StreamId};
+    use crate::raft::types::core::value_object::ValueObject;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
 
     fn arguments(args: &[&str]) -> Vec<Value> {
         args.iter()
@@ -585,6 +593,82 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<XReadGroupParams, ProtocolError> {
         XReadGroupParams::parse(&arguments(args))
+    }
+
+    fn cache_with_group(consumer: Option<&str>, start: GroupStart) -> MyCache {
+        let mut stream = RedisStream::new();
+        stream
+            .xadd(
+                AddId::Explicit(StreamId::new(1, 0)),
+                vec![(b"field".to_vec(), b"value".to_vec())],
+            )
+            .unwrap();
+        stream.xgroup_create(b"g", start, None).unwrap();
+        if let Some(consumer) = consumer {
+            stream
+                .xgroup_createconsumer(b"g", consumer.as_bytes())
+                .unwrap();
+        }
+        let cache = MyCache::new(1).unwrap();
+        cache.databases[0].mocha.insert_persistent(
+            Bytes::from_static(b"s"),
+            MyValue::new(ValueObject::Stream(Arc::new(RwLock::new(stream)))),
+        );
+        cache
+    }
+
+    #[test]
+    fn capture_tracks_immediate_data_and_consumer_presence() {
+        let params = parse(&[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "c",
+            "BLOCK",
+            "0",
+            "STREAMS",
+            "s",
+            ">",
+        ])
+        .unwrap();
+        let (_, _, immediate, consumer_missing) = params
+            .capture(&cache_with_group(Some("c"), GroupStart::Last), 0)
+            .unwrap();
+        assert!(!immediate);
+        assert!(!consumer_missing);
+
+        let (_, _, immediate, consumer_missing) = params
+            .capture(&cache_with_group(None, GroupStart::Last), 0)
+            .unwrap();
+        assert!(!immediate);
+        assert!(consumer_missing);
+
+        let (_, _, immediate, consumer_missing) = params
+            .capture(
+                &cache_with_group(Some("c"), GroupStart::Id(StreamId::ZERO)),
+                0,
+            )
+            .unwrap();
+        assert!(immediate);
+        assert!(!consumer_missing);
+
+        let history = parse(&[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "c",
+            "BLOCK",
+            "0",
+            "STREAMS",
+            "s",
+            "0",
+        ])
+        .unwrap();
+        let (_, _, immediate, consumer_missing) = history
+            .capture(&cache_with_group(Some("c"), GroupStart::Last), 0)
+            .unwrap();
+        assert!(immediate);
+        assert!(!consumer_missing);
     }
 
     #[test]

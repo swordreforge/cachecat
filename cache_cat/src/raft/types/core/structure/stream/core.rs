@@ -725,6 +725,13 @@ impl RedisStream {
         self.groups.contains_key(name)
     }
 
+    /// Whether the group already owns this consumer name.
+    pub fn has_consumer(&self, group: &[u8], consumer: &[u8]) -> bool {
+        self.groups
+            .get(group)
+            .is_some_and(|group| group.consumers.contains_key(consumer))
+    }
+
     /// Delivery cursor of a consumer group. XREADGROUP arms a local waiter with
     /// it so that only entries strictly after the cursor wake the client.
     pub fn group_last_delivered(&self, name: &[u8]) -> Result<StreamId> {
