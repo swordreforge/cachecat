@@ -3,10 +3,10 @@ name = "cache_cat"
 version = "0.1.0"
 edition = "2024"
 description = "An extremely high-performance strongly consistent key value pair database"
-documentation = "https://github.com/nasuiyile/cache-cat"
+documentation = "https://github.com/swordreforge/cachecat"
 readme = "README.md"
-homepage = "https://github.com/nasuiyile/cache-cat"
-repository = "https://github.com/nasuiyile/cache-cat"
+homepage = "https://github.com/swordreforge/cachecat"
+repository = "https://github.com/swordreforge/cachecat"
 license = "Apache-2.0"
 
 [dependencies]

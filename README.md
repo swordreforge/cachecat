@@ -1,10 +1,18 @@
 # cache-cat
 
 <div align="center">
-<a href="https://github.com/nasuiyile/cache-cat/blob/master/README.md">English</a> ｜
-<a href="https://github.com/nasuiyile/cache-cat/blob/master/README_zh.md">简体中文</a> |
-<a href="https://nasuiyile.github.io/cache-cat-website">Official Website</a>
+<a href="README.md">English</a> ｜
+<a href="README_zh.md">简体中文</a> |
+<a href="https://nasuiyile.github.io/cache-cat-website">Upstream Website</a>
 </div>
+
+> [!NOTE]
+> This repository is a fork of
+> [nasuiyile/cache-cat](https://github.com/nasuiyile/cache-cat).
+> It adds a complete Redis Stream command surface, a Raft-aware blocking wake-up model,
+> deterministic replicated clocks and several correctness fixes. See [FORK.md](FORK.md)
+> for the change summary and the
+> [`5ed250c...master` comparison](https://github.com/swordreforge/cachecat/compare/5ed250c...master).
 
 
 ## Introduction
@@ -92,7 +100,8 @@ We believe that cache systems care more about read latency than write latency, a
 
 ---
 
-This project includes code derived from:
+This project is a fork of [nasuiyile/cache-cat](https://github.com/nasuiyile/cache-cat),
+and includes code derived from:
 
 - https://github.com/lichuang/coredb
 - https://github.com/lichuang/rockraft
