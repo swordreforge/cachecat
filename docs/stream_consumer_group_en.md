@@ -182,13 +182,16 @@ Checked against `redis/8.0` `src/t_stream.c`:
   No event is recorded without waiters, and snapshot replay keeps `effects = None`.
 - **First submit of a blocking XREADGROUP**: an empty `>` wait used to submit a Raft
   write immediately just to create/touch the consumer. `capture` now checks under the
-  global locks whether any key has readable entries or a history mode; when nothing is
-  ready it registers a local waiter without submitting, and the real group read is
-  submitted only after an `XADD` wakes it. A timeout or disconnect therefore performs no
-  write at all. Non-blocking, history and already-ready reads still submit immediately and
-  keep Redis' create/touch behaviour. The trade-off is that the consumer is absent from
-  `XINFO CONSUMERS`/`XINFO GROUPS` while the client is idle and appears on first delivery,
-  with `seen-time` based on that delivery.
+  global locks whether any key has readable entries, a history mode, and whether the group
+  already owns this consumer:
+  - if the consumer is **missing**, the write still happens immediately so it is visible in
+    `XINFO` while blocked and survives a timeout, matching Redis;
+  - if every group already knows the consumer and nothing is ready, the waiter is registered
+    without a write; the group read is submitted only after an `XADD` wakes it, and a
+    timeout/disconnect does not refresh `seen-time`.
+  Non-blocking, history and already-ready reads still submit immediately. The only remaining
+  trade-off is that an existing consumer's `seen-time`/`idle` is not refreshed while it waits;
+  new consumers keep Redis' visibility and timeout behaviour.
 - **Unused `SharedStream` stack removed**: `SharedStream` carried a second, `Notify`-based
   local blocking implementation that no command called. A local notification only observes
   this node's writes and cannot be authoritative while streams are replicated through Raft;
@@ -209,7 +212,7 @@ Checked against `redis/8.0` `src/t_stream.c`:
 
 ## 6. Verification
 
-- `cargo test -p cache_cat --lib -- --skip test::tests::test_add` → **605 passed / 0 failed**
+- `cargo test -p cache_cat --lib -- --skip test::tests::test_add` → **606 passed / 0 failed**
   (`test_add` needs a live node on port 5001).
 - Coverage includes argument/boundary/error text for all fourteen commands, PEL equality after
   snapshot replay, generation round-trips and rejection, one wake per group, per-group
@@ -231,24 +234,25 @@ Checked against `redis/8.0` `src/t_stream.c`:
   every error branch; XACKDEL/XDELEX return the correct status arrays for all reference
   policies through MULTI/EXEC and EVAL; DEL/UNLINK wakes a blocked XREADGROUP with
   `NOGROUP` and SET/MSET overwrite wakes it with `WRONGTYPE`, while a plain XREAD stays
-  blocked until the next XADD on single-key, multi-key, MULTI and EVAL paths; an empty
-  blocking XREADGROUP has no consumer while it waits, a timeout/disconnect creates none,
-  and XADD creates/touches it on delivery while non-blocking/history/ready reads still
-  create it immediately; snapshots are written as `MCDC\x02` and restore data and PEL
-  after a restart.
+  blocked until the next XADD on single-key, multi-key, MULTI and EVAL paths; a missing
+  blocking-XREADGROUP consumer is created immediately and survives timeout, an existing one
+  is not touched while idle, and XADD updates seen-time/PEL on delivery while
+  non-blocking/history/ready reads still create it; snapshots are written as `MCDC\x02`
+  and restore data and PEL after a restart.
 
 ## 7. Known limits and next steps
 
 - **The Redis Stream command surface is complete**: `XLEN`, `XRANGE`, `XREVRANGE`, `XINFO`,
   `XACK`, `XACKDEL`, `XCLAIM`, `XAUTOCLAIM`, `XDEL`, `XDELEX`, `XTRIM`, `XSETID`, `XGROUP`,
   `XREAD`, `XREADGROUP` and `XADD` are all exposed.
-- An empty blocking XREADGROUP creates no consumer while it waits (or on timeout/disconnect);
-  it appears on the first real delivery, so `XINFO` does not show it during the wait. This is
-  the trade-off for removing the idle Raft write.
+- An existing consumer is not touched while a blocking XREADGROUP waits; its
+  `seen-time`/`idle` refreshes on first delivery. A missing consumer is still created
+  immediately, so it is visible during the wait and survives a timeout.
 
 ## 8. Commits
 
 ```
+8c08833 write a blocking XREADGROUP consumer only when it is new
 7c3b56f remove the unused SharedStream notification stack
 d81dd47 defer the first Raft write of a blocking XREADGROUP
 ad05cc7 wake blocked consumer groups on UNLINK and stream overwrite

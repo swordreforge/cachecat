@@ -228,14 +228,16 @@ enum StreamWaiter {
 ### 4.6 阻塞 XREADGROUP 的首次提交
 
 - 以前空阻塞 `>` 读会先提交一次 Raft 写，只为创建/触碰 consumer，然后才注册等待。
-  现在 `capture` 在全局锁内检查每个 key 是否有可读条目、是否包含历史读模式：
-  - 没有可读内容时只注册本地 waiter，**不提交** Raft 写；
-  - `XADD` 唤醒后才提交真正的组读，超时/断开则一次写都不产生。
+  现在 `capture` 在全局锁内检查每个 key 是否有可读条目、是否包含历史读模式，以及
+  目标 group 是否已经拥有该 consumer：
+  - consumer **不存在**：仍立即提交，创建/触碰后再等待，保证等待期间 `XINFO` 可见，
+    超时后 consumer 也会保留（与 Redis 一致）；
+  - consumer 已存在且没有可读内容：只注册本地 waiter，**不提交** Raft 写；`XADD`
+    唤醒后才提交真正的组读，超时/断开不再刷新 `seen-time`。
 - 非阻塞读、历史读（显式 ID）以及已经有新条目的读仍然立即提交，保持 Redis 的
   “空读也创建/触碰 consumer”行为。
-- 代价：等待期间 consumer 尚未创建，`XINFO CONSUMERS` / `XINFO GROUPS` 的 consumers
-  数量看不到它；首次实际交付时才出现，`seen-time` 也以交付时刻为准。这是去掉空闲
-  Raft 写的取舍。
+- 代价仅剩：已存在的 consumer 在空闲等待期间 `seen-time` / `idle` 不刷新，直到首次
+  实际交付；新建 consumer 的可见性和超时保留行为与 Redis 一致。
 
 ### 4.7 移除未使用的 SharedStream 本地阻塞栈
 
@@ -269,7 +271,7 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
 ## 6. 测试与验证
 
 - 单元 + 集成测试：`cargo test -p cache_cat --lib -- --skip test::tests::test_add`
-  → **605 passed / 0 failed**（`test_add` 是需要本地 5001 节点的手工测试）。
+  → **606 passed / 0 failed**（`test_add` 是需要本地 5001 节点的手工测试）。
 - 覆盖点：十四个命令的参数/边界/错误文案、快照回放后的 PEL 一致性、generation 快照往返与
   越界拒绝、过期 generation 被拒、单 group 单唤醒、多 group 各自唤醒、销毁后全部收到
   `NOGROUP`、非追加事件不扫描 XREAD、`XREVRANGE` 的 end/start 反转、`XINFO` 的
@@ -296,8 +298,9 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
   - `DEL` / `UNLINK` 删除 stream 后，阻塞的 XREADGROUP 立即收到 `NOGROUP`；`SET` /
     `MSET` 覆盖 stream 时收到 `WRONGTYPE`；普通 XREAD 均保持阻塞，下一次 XADD 才唤醒；
     单键/多键路径与 `MULTI`、`EVAL` 行为一致；
-  - 空阻塞 XREADGROUP 等待期间 consumer 不存在；超时/断开后仍不存在；`XADD` 交付时
-    才创建并更新 PEL；非阻塞读、历史读和已有数据的读仍立即创建 consumer；
+  - 空阻塞 XREADGROUP 的 consumer 不存在时立即创建并保持可见，超时后仍保留；
+    consumer 已存在时等待期间不刷新 `seen-time` / `idle`；`XADD` 交付时更新 PEL；
+    非阻塞读、历史读和已有数据的读仍立即创建 consumer；
   - 快照写入头部为 `MCDC\x02`，重启后数据、消费者组与 PEL 正常恢复。
 
 ## 7. 已知限制与后续方向
@@ -305,13 +308,14 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
 - **Redis Stream 命令面已补齐**：`XLEN`、`XRANGE`、`XREVRANGE`、`XINFO`、`XACK`、
   `XACKDEL`、`XCLAIM`、`XAUTOCLAIM`、`XDEL`、`XDELEX`、`XTRIM`、`XSETID`、`XGROUP`、
   `XREAD`、`XREADGROUP`、`XADD` 均已暴露。
-- 空阻塞 XREADGROUP 在等待/超时/断开期间不会创建 consumer，首次实际交付时才写入；
-  `XINFO` 在等待期间看不到该 consumer，这是去掉空闲 Raft 写的取舍。
+- 已存在的 consumer 在空闲阻塞等待期间不会刷新 `seen-time` / `idle`，首次实际交付时
+  才更新；新建 consumer 仍立即写入，等待和超时期间可见。
 - 若等待期间 group 被销毁，客户端在收到 `NOGROUP` 时不会重试；这符合 Redis 语义。
 
 ## 8. 提交列表
 
 ```
+8c08833 write a blocking XREADGROUP consumer only when it is new
 7c3b56f remove the unused SharedStream notification stack
 d81dd47 defer the first Raft write of a blocking XREADGROUP
 ad05cc7 wake blocked consumer groups on UNLINK and stream overwrite
