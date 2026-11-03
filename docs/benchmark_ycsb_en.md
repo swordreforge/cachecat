@@ -15,6 +15,10 @@ Redis binding against a single cache-cat node. It is separate from the custom
 - Threads: 64
 - Workloads: A (50/50 read/update), B (95/5), C (100% read)
 
+Note: YCSB's Redis binding stores each record as a Redis hash and uses
+`HMSET`/`HGETALL` (not string `SET`/`GET`). These results therefore measure
+hash-heavy workloads as produced by the stock YCSB binding.
+
 YCSB's `bin/ycsb` is a Python 2 script. This machine has no Python 2, so the
 equivalent `bin/ycsb.sh` launcher was used.
 
@@ -74,5 +78,26 @@ All operations returned `OK`; no errors were reported.
 - These numbers are for a single local node with no network or TLS overhead, 1 KB
   values and a 1M-key space. They are not a cluster benchmark and should not be
   treated as universal capacity numbers.
+
+## Profiling notes
+
+A `perf record -e task-clock -F 199 -g --call-graph dwarf` run during workload A
+(50/50) and workload C (100% read) showed:
+
+- allocator work (`mi_free`, `_mi_page_malloc_zero`, page collection) is a large
+  user-space cost;
+- `Bytes` clone/drop and RESP/hash encoding are visible on the read path;
+- Tokio scheduling and blocking-pool task polling are visible;
+- `raft_engine::Engine::write` appears on the write path, but no `memcpy`,
+  `sendfile` or `copy_file_range` appears near the top;
+- roughly 40% of samples are unattributed kernel frames because kernel symbols are
+  masked on this host, so the profile cannot separate network/syscall/fsync costs
+  further.
+
+Implication: for these 1 KB hash workloads, zero-copy would not address the top
+user-space costs, and io_uring is not an obvious first-order win. The more useful
+next steps are reducing allocation/clone work on HGETALL/encoding, batching Raft log
+writes, and streaming snapshots. Kernel/syscall profiling with resolved symbols is
+required before treating io_uring as a priority.
 
 For memory implications and host sizing, see `capacity_planning_en.md`.
