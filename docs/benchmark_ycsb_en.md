@@ -100,4 +100,13 @@ next steps are reducing allocation/clone work on HGETALL/encoding, batching Raft
 writes, and streaming snapshots. Kernel/syscall profiling with resolved symbols is
 required before treating io_uring as a priority.
 
+### RESP encoder allocation A/B
+
+A follow-up change replaced the temporary `String` used for every RESP bulk/frame
+length (and integer reply) with stack decimal formatting. On the same host, five
+workload-C runs per binary (1M reads each) measured a median of 291.6k ops/s for
+the old encoder and 297.6k ops/s for the new one; average read latency moved from
+213.4 us to 208.3 us. The difference is small (about 2%) and close to run-to-run
+noise, but the new path removes one allocation per bulk and per array/map length.
+
 For memory implications and host sizing, see `capacity_planning_en.md`.

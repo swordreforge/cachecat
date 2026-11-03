@@ -48,11 +48,16 @@
 - `RedisOperation::RedisEvalSha` 带 `#[serde(skip)]`，声明在其后的变体会写出越界
   serde 下标，导致 Raft apply 失败。
 
+### 性能
+
+- RESP 编码的长度和整数回复改为栈上格式化，不再为每个 bulk/frame 分配临时
+  `String`。
+
 ### 文档与测试
 
 - 新增中英文 Stream 设计文档、容量规划与官方 YCSB 测试说明（`docs/`）。
 - 当前测试：`cargo test -p cache_cat --lib -- --skip test::tests::test_add`
-  （606 passed）。
+  （607 passed）。
 
 ## 兼容性
 
