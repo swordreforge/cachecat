@@ -4,8 +4,8 @@
 //! 平均值外推；本项目没有 listpack/intset/quicklist 编码，不套用其阈值。
 
 use crate::raft::types::core::mocha::bloom_filter::BloomObject;
-use crate::raft::types::core::structure::sorted_set::SortedSet;
 use crate::raft::types::core::structure::scan_map::ScanMap as HashMap;
+use crate::raft::types::core::structure::sorted_set::SortedSet;
 use crate::raft::types::core::value_object::HashValue;
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -141,7 +141,6 @@ pub fn estimate_bloom_usage(value: &Arc<Mutex<BloomObject>>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::types::core::structure::stream::SharedStream;
     use crate::raft::types::core::value_object::ValueObject;
 
     #[test]

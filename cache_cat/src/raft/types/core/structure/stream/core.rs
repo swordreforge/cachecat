@@ -35,7 +35,7 @@ pub(super) struct Group {
     pub(super) entries_read: Option<u64>,
     pub(super) pel: TreeMap<Key, Pending>,
     pub(super) consumers: HashMap<Vec<u8>, Consumer>,
-    /// Detect destroy/recreate while a SharedStream reader is sleeping.
+    /// Detect destroy/recreate while a blocked group reader is waiting.
     pub(super) identity: Arc<()>,
     /// Replicated generation, assigned from `next_group_generation` on CREATE.
     /// Unlike `identity` it survives snapshots and can be compared on every

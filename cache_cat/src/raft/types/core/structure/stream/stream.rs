@@ -33,7 +33,7 @@ struct Group {
     entries_read: Option<u64>,
     pel: TreeMap<Key, Pending>,
     consumers: HashMap<Vec<u8>, Consumer>,
-    /// Detect destroy/recreate while a SharedStream reader is sleeping.
+    /// Detect destroy/recreate while a blocked group reader is waiting.
     identity: Arc<()>,
 }
 impl Group {

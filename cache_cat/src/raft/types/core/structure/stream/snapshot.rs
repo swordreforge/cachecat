@@ -18,8 +18,8 @@ pub const SNAPSHOT_VERSION: u32 = 4;
 /// pointers, or clock implementations are persisted. Binary names remain bytes.
 ///
 /// Deserializing this DTO does not validate it; `into_stream` does. Deserializing
-/// RedisStream or SharedStream validates automatically. Bound input sizes at the
-/// codec/I/O boundary when decoding untrusted data.
+/// `RedisStream` validates automatically. Bound input sizes at the codec/I/O
+/// boundary when decoding untrusted data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamSnapshot {
