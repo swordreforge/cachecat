@@ -50,7 +50,7 @@
 
 ### 文档与测试
 
-- 新增中英文 Stream 设计文档（`docs/`）。
+- 新增中英文 Stream 设计文档、容量规划与官方 YCSB 测试说明（`docs/`）。
 - 当前测试：`cargo test -p cache_cat --lib -- --skip test::tests::test_add`
   （606 passed）。
 

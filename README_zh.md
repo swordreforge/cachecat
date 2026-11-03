@@ -35,6 +35,12 @@ YCSB 吞吐量基准测试结果：
 
 ![YCSB 吞吐量基准测试](benchmark/res/ycsb_throughput.png)
 
+官方 YCSB Redis binding 测试（workload A/B/C、复现命令与注意事项）：
+[docs/benchmark_ycsb_zh.md](docs/benchmark_ycsb_zh.md)。
+
+容量规划与全量副本内存模型：
+[docs/capacity_planning_zh.md](docs/capacity_planning_zh.md)。
+
 ## 功能
 
 对于许多小公司来说，你可能只想构建一个高可用的应用，而不想引入成吨的中间件服务。

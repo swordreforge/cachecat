@@ -57,7 +57,8 @@ All are registered in the server and Lua command factories, so they work in
 
 ### Docs and tests
 
-- Added English/Chinese stream design documents under `docs/`.
+- Added English/Chinese stream design documents, capacity planning and an official
+  YCSB benchmark note under `docs/`.
 - Current test suite: `cargo test -p cache_cat --lib -- --skip test::tests::test_add`
   (606 passing).
 

@@ -37,6 +37,12 @@ YCSB throughput benchmark results:
 
 ![YCSB throughput benchmark](benchmark/res/ycsb_throughput.png)
 
+Official YCSB Redis-binding run (workloads A/B/C, reproduction commands and caveats):
+[docs/benchmark_ycsb_en.md](docs/benchmark_ycsb_en.md).
+
+Capacity planning and the full-replica memory model:
+[docs/capacity_planning_en.md](docs/capacity_planning_en.md).
+
 ## Features
 
 For many small companies, you may simply want to build a highly available application without introducing a large number of middleware services.
