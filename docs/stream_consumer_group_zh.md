@@ -237,6 +237,15 @@ enum StreamWaiter {
   数量看不到它；首次实际交付时才出现，`seen-time` 也以交付时刻为准。这是去掉空闲
   Raft 写的取舍。
 
+### 4.7 移除未使用的 SharedStream 本地阻塞栈
+
+- `SharedStream` 自带一套基于 `Notify` 的本地等待栈，但服务端从未接入：stream 写入
+  必须经过 Raft，本地 Notify 只能感知本节点写入，无法作为跨副本的权威唤醒源，而且
+  与现有的 `StreamWaiter` / `BlockingKeys` 重复。
+- 因此删除 `SharedStream`、`Block`、`BatchAddError` 及其测试，阻塞统一由 Raft-aware
+  的 `BlockingKeys` 负责；服务端继续使用 `Arc<RwLock<RedisStream>>`。
+- 这样消除了“两套阻塞语义”的隐患，也不存在绕过 Raft 的本地唤醒路径。
+
 ## 5. 本轮顺带修复的两个既有问题
 
 ### 5.1 快照文件版本号没有跟上格式
@@ -260,7 +269,7 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
 ## 6. 测试与验证
 
 - 单元 + 集成测试：`cargo test -p cache_cat --lib -- --skip test::tests::test_add`
-  → **622 passed / 0 failed**（`test_add` 是需要本地 5001 节点的手工测试）。
+  → **605 passed / 0 failed**（`test_add` 是需要本地 5001 节点的手工测试）。
 - 覆盖点：十四个命令的参数/边界/错误文案、快照回放后的 PEL 一致性、generation 快照往返与
   越界拒绝、过期 generation 被拒、单 group 单唤醒、多 group 各自唤醒、销毁后全部收到
   `NOGROUP`、非追加事件不扫描 XREAD、`XREVRANGE` 的 end/start 反转、`XINFO` 的
@@ -299,12 +308,11 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
 - 空阻塞 XREADGROUP 在等待/超时/断开期间不会创建 consumer，首次实际交付时才写入；
   `XINFO` 在等待期间看不到该 consumer，这是去掉空闲 Raft 写的取舍。
 - 若等待期间 group 被销毁，客户端在收到 `NOGROUP` 时不会重试；这符合 Redis 语义。
-- 服务端仍使用 `Arc<RwLock<RedisStream>>`，`SharedStream` 自带的 Notify 阻塞栈未被使用；
-  将来若要统一，需要先解决"本地阻塞不能绕过 Raft"这一前提。
 
 ## 8. 提交列表
 
 ```
+7c3b56f remove the unused SharedStream notification stack
 d81dd47 defer the first Raft write of a blocking XREADGROUP
 ad05cc7 wake blocked consumer groups on UNLINK and stream overwrite
 3c6666f wake blocked consumer groups when DEL removes a stream

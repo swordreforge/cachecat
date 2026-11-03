@@ -189,6 +189,12 @@ Checked against `redis/8.0` `src/t_stream.c`:
   keep Redis' create/touch behaviour. The trade-off is that the consumer is absent from
   `XINFO CONSUMERS`/`XINFO GROUPS` while the client is idle and appears on first delivery,
   with `seen-time` based on that delivery.
+- **Unused `SharedStream` stack removed**: `SharedStream` carried a second, `Notify`-based
+  local blocking implementation that no command called. A local notification only observes
+  this node's writes and cannot be authoritative while streams are replicated through Raft;
+  it also duplicated `StreamWaiter`/`BlockingKeys`. `SharedStream`, `Block`, `BatchAddError`
+  and their tests are deleted, leaving the Raft-aware registry as the single wake-up
+  mechanism. The server continues to use `Arc<RwLock<RedisStream>>`.
 
 ## 5. Two existing defects fixed along the way
 
@@ -203,7 +209,7 @@ Checked against `redis/8.0` `src/t_stream.c`:
 
 ## 6. Verification
 
-- `cargo test -p cache_cat --lib -- --skip test::tests::test_add` → **622 passed / 0 failed**
+- `cargo test -p cache_cat --lib -- --skip test::tests::test_add` → **605 passed / 0 failed**
   (`test_add` needs a live node on port 5001).
 - Coverage includes argument/boundary/error text for all fourteen commands, PEL equality after
   snapshot replay, generation round-trips and rejection, one wake per group, per-group
@@ -239,12 +245,11 @@ Checked against `redis/8.0` `src/t_stream.c`:
 - An empty blocking XREADGROUP creates no consumer while it waits (or on timeout/disconnect);
   it appears on the first real delivery, so `XINFO` does not show it during the wait. This is
   the trade-off for removing the idle Raft write.
-- The server keeps using `Arc<RwLock<RedisStream>>`; the `SharedStream` notification stack is
-  unused and cannot become the authority while group reads must go through Raft.
 
 ## 8. Commits
 
 ```
+7c3b56f remove the unused SharedStream notification stack
 d81dd47 defer the first Raft write of a blocking XREADGROUP
 ad05cc7 wake blocked consumer groups on UNLINK and stream overwrite
 3c6666f wake blocked consumer groups when DEL removes a stream
