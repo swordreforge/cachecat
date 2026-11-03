@@ -139,9 +139,55 @@ impl Value {
     }
 
     #[inline]
+    fn put_u64(buf: &mut impl BufMut, mut value: u64) {
+        // RESP lengths and integer replies are tiny. Format them into a stack
+        // buffer instead of allocating a temporary String for every bulk/frame.
+        let mut digits = [0u8; 20]; // u64::MAX has 20 decimal digits
+        let mut index = digits.len();
+        loop {
+            index -= 1;
+            digits[index] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        buf.put_slice(&digits[index..]);
+    }
+
+    #[inline]
+    fn put_i64(buf: &mut impl BufMut, value: i64) {
+        if value < 0 {
+            buf.put_u8(b'-');
+            Self::put_u64(buf, value.unsigned_abs());
+        } else {
+            Self::put_u64(buf, value as u64);
+        }
+    }
+
+    #[inline]
+    fn put_usize(buf: &mut impl BufMut, value: usize) {
+        Self::put_u64(buf, value as u64);
+    }
+
+    #[inline]
+    fn put_line_usize(buf: &mut impl BufMut, mode: u8, value: usize) {
+        buf.put_u8(mode);
+        Self::put_usize(buf, value);
+        buf.put_slice(b"\r\n");
+    }
+
+    #[inline]
+    fn put_line_i64(buf: &mut impl BufMut, value: i64) {
+        buf.put_u8(b':');
+        Self::put_i64(buf, value);
+        buf.put_slice(b"\r\n");
+    }
+
+    #[inline]
     fn put_bulk(buf: &mut impl BufMut, data: &[u8]) {
         buf.put_u8(b'$');
-        buf.put_slice(data.len().to_string().as_bytes());
+        Self::put_usize(buf, data.len());
         buf.put_slice(b"\r\n");
         buf.put_slice(data);
         buf.put_slice(b"\r\n");
@@ -151,7 +197,7 @@ impl Value {
         match self {
             Value::SimpleString(s) => Self::put_line(buf, b'+', s.as_bytes()),
             Value::Error(e) => Self::put_error(buf, e),
-            Value::Integer(i) => Self::put_line(buf, b':', i.to_string().as_bytes()),
+            Value::Integer(i) => Self::put_line_i64(buf, *i),
             Value::Null => {
                 if proto == 3 {
                     buf.put_slice(b"_\r\n");
@@ -175,16 +221,16 @@ impl Value {
                 }
             }
             Value::Array(Some(items)) => {
-                Self::put_line(buf, b'*', items.len().to_string().as_bytes());
+                Self::put_line_usize(buf, b'*', items.len());
                 for item in items {
                     item.encode_to(proto, buf);
                 }
             }
             Value::Map(pairs) => {
                 if proto == 3 {
-                    Self::put_line(buf, b'%', pairs.len().to_string().as_bytes());
+                    Self::put_line_usize(buf, b'%', pairs.len());
                 } else {
-                    Self::put_line(buf, b'*', (pairs.len() * 2).to_string().as_bytes());
+                    Self::put_line_usize(buf, b'*', pairs.len() * 2);
                 }
                 for (k, v) in pairs {
                     k.encode_to(proto, buf);
@@ -193,14 +239,14 @@ impl Value {
             }
             Value::Set(items) => {
                 let mode = if proto == 3 { b'~' } else { b'*' };
-                Self::put_line(buf, mode, items.len().to_string().as_bytes());
+                Self::put_line_usize(buf, mode, items.len());
                 for item in items {
                     item.encode_to(proto, buf);
                 }
             }
             Value::Push(items) => {
                 let mode = if proto == 3 { b'>' } else { b'*' };
-                Self::put_line(buf, mode, items.len().to_string().as_bytes());
+                Self::put_line_usize(buf, mode, items.len());
                 for item in items {
                     item.encode_to(proto, buf);
                 }
@@ -235,7 +281,7 @@ impl Value {
                         fmt[i] = *b;
                     }
                     buf.put_u8(b'=');
-                    buf.put_slice((data.len() + 4).to_string().as_bytes());
+                    Self::put_usize(buf, data.len() + 4);
                     buf.put_slice(b"\r\n");
                     buf.put_slice(&fmt);
                     buf.put_u8(b':');
@@ -248,7 +294,7 @@ impl Value {
             Value::BulkError(e) => {
                 if proto == 3 {
                     buf.put_u8(b'!');
-                    buf.put_slice(e.len().to_string().as_bytes());
+                    Self::put_usize(buf, e.len());
                     buf.put_slice(b"\r\n");
                     buf.put_slice(e.as_bytes());
                     buf.put_slice(b"\r\n");
@@ -259,7 +305,7 @@ impl Value {
             Value::MemberScores(pairs) => {
                 if proto == 3 {
                     // Array of [member, score] pairs, score as double.
-                    Self::put_line(buf, b'*', pairs.len().to_string().as_bytes());
+                    Self::put_line_usize(buf, b'*', pairs.len());
                     for (member, score) in pairs {
                         buf.put_slice(b"*2\r\n");
                         Self::put_bulk(buf, member);
@@ -267,7 +313,7 @@ impl Value {
                     }
                 } else {
                     // Flat array [m1, s1, m2, s2, ...], scores as bulk strings.
-                    Self::put_line(buf, b'*', (pairs.len() * 2).to_string().as_bytes());
+                    Self::put_line_usize(buf, b'*', pairs.len() * 2);
                     for (member, score) in pairs {
                         Self::put_bulk(buf, member);
                         Self::put_bulk(buf, format_double(*score).as_bytes());
@@ -282,7 +328,7 @@ impl Value {
             }
             Value::MapWithResp2 { entries, resp2 } => {
                 if proto == 3 {
-                    Self::put_line(buf, b'%', entries.len().to_string().as_bytes());
+                    Self::put_line_usize(buf, b'%', entries.len());
                     for (k, v) in entries {
                         k.encode_to(proto, buf);
                         v.encode_to(proto, buf);
@@ -290,14 +336,14 @@ impl Value {
                 } else {
                     match resp2 {
                         Resp2MapEncoding::Flat => {
-                            Self::put_line(buf, b'*', (entries.len() * 2).to_string().as_bytes());
+                            Self::put_line_usize(buf, b'*', entries.len() * 2);
                             for (k, v) in entries {
                                 k.encode_to(proto, buf);
                                 v.encode_to(proto, buf);
                             }
                         }
                         Resp2MapEncoding::Pairs => {
-                            Self::put_line(buf, b'*', entries.len().to_string().as_bytes());
+                            Self::put_line_usize(buf, b'*', entries.len());
                             for (k, v) in entries {
                                 buf.put_slice(b"*2\r\n");
                                 k.encode_to(proto, buf);
@@ -305,7 +351,7 @@ impl Value {
                             }
                         }
                         Resp2MapEncoding::Values => {
-                            Self::put_line(buf, b'*', entries.len().to_string().as_bytes());
+                            Self::put_line_usize(buf, b'*', entries.len());
                             for (_, v) in entries {
                                 v.encode_to(proto, buf);
                             }
@@ -825,6 +871,28 @@ mod tests {
         let reply = Value::BulkError("ERR x\r\n:123\r\n".into());
         assert_eq!(enc(&reply, 3), "!13\r\nERR x\r\n:123\r\n\r\n");
         assert_eq!(enc(&reply, 2), "-ERR x  :123  \r\n");
+    }
+
+    #[test]
+    fn test_encode_decimal_boundaries() {
+        assert_eq!(enc(&Value::Integer(0), 2), ":0\r\n");
+        assert_eq!(enc(&Value::Integer(-1), 2), ":-1\r\n");
+        assert_eq!(
+            enc(&Value::Integer(i64::MIN), 2),
+            format!(":{}\r\n", i64::MIN)
+        );
+        assert_eq!(
+            enc(&Value::Integer(i64::MAX), 2),
+            format!(":{}\r\n", i64::MAX)
+        );
+
+        let bulk = Value::BulkString(Some(Bytes::from(vec![b'x'; 100_000])));
+        let wire = bulk.encode_proto(2);
+        assert!(wire.starts_with(b"$100000\r\n"));
+        assert_eq!(wire.len(), 1 + 6 + 2 + 100_000 + 2);
+
+        let array = Value::Array(Some(vec![Value::Integer(1); 100]));
+        assert!(array.encode_proto(2).starts_with(b"*100\r\n"));
     }
 
     #[test]
