@@ -59,13 +59,15 @@ All are registered in the server and Lua command factories, so they work in
 
 - RESP encoding formats lengths and integer replies into stack buffers instead of
   allocating a temporary `String` for every bulk/frame.
+- HGETALL returns a string-map reply directly, avoiding a `Value` wrapper and
+  `Value` sorting for every field/value pair.
 
 ### Docs and tests
 
 - Added English/Chinese stream design documents, capacity planning and an official
   YCSB benchmark note under `docs/`.
 - Current test suite: `cargo test -p cache_cat --lib -- --skip test::tests::test_add`
-  (607 passing).
+  (608 passing).
 
 ## Compatibility
 

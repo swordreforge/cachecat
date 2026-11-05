@@ -212,7 +212,7 @@ Checked against `redis/8.0` `src/t_stream.c`:
 
 ## 6. Verification
 
-- `cargo test -p cache_cat --lib -- --skip test::tests::test_add` → **607 passed / 0 failed**
+- `cargo test -p cache_cat --lib -- --skip test::tests::test_add` → **608 passed / 0 failed**
   (`test_add` needs a live node on port 5001).
 - Coverage includes argument/boundary/error text for all fourteen commands, PEL equality after
   snapshot replay, generation round-trips and rejection, one wake per group, per-group

@@ -271,7 +271,7 @@ Raft 日志 apply 时报 `bincode2 decode: invalid value: integer ...`。
 ## 6. 测试与验证
 
 - 单元 + 集成测试：`cargo test -p cache_cat --lib -- --skip test::tests::test_add`
-  → **607 passed / 0 failed**（`test_add` 是需要本地 5001 节点的手工测试）。
+  → **608 passed / 0 failed**（`test_add` 是需要本地 5001 节点的手工测试）。
 - 覆盖点：十四个命令的参数/边界/错误文案、快照回放后的 PEL 一致性、generation 快照往返与
   越界拒绝、过期 generation 被拒、单 group 单唤醒、多 group 各自唤醒、销毁后全部收到
   `NOGROUP`、非追加事件不扫描 XREAD、`XREVRANGE` 的 end/start 反转、`XINFO` 的

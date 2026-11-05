@@ -52,12 +52,14 @@
 
 - RESP 编码的长度和整数回复改为栈上格式化，不再为每个 bulk/frame 分配临时
   `String`。
+- HGETALL 直接返回 string-map 回复，避免为每个 field/value 构造 `Value` 包装和
+  对 `Value` 排序。
 
 ### 文档与测试
 
 - 新增中英文 Stream 设计文档、容量规划与官方 YCSB 测试说明（`docs/`）。
 - 当前测试：`cargo test -p cache_cat --lib -- --skip test::tests::test_add`
-  （607 passed）。
+  （608 passed）。
 
 ## 兼容性
 
