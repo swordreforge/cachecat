@@ -437,7 +437,7 @@ fn exec_reads_and_nested_lua_replay_identically_on_rebuilt_replicas() {
         };
         assert_eq!(results.len(), LABELS.len() + 1);
         assert!(matches!(&results[3], Value::Set(members) if members.len() == 32));
-        assert!(matches!(&results[4], Value::Map(fields) if fields.len() == 6));
+        assert!(matches!(&results[4], Value::StringMap(fields) if fields.len() == 6));
         assert_saved_results(cache, "exec:", results.last().unwrap());
         for proto in [2, 3] {
             assert_eq!(reply.encode_proto(proto), replies[0].encode_proto(proto));

@@ -39,31 +39,18 @@ impl ReadCommand for HGetAllParams {
             Some(v) => match v.value.data {
                 ValueObject::Hash(map) => {
                     let guard = map.lock();
-                    let result = guard
-                        .iter()
-                        .map(|(field, value)| {
-                            (
-                                Value::BulkString(Some(field.clone())),
-                                Value::BulkString(Some(value.to_bytes())),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    Value::Map(result)
+                    let mut result = Vec::with_capacity(guard.len());
+                    for (field, value) in guard.iter() {
+                        result.push((field.clone(), value.to_bytes()));
+                    }
+                    // Hash iteration order is layout-dependent; keep replies
+                    // deterministic for EXEC/Lua and every replica.
+                    result.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                    Value::StringMap(result)
                 }
                 _ => CacheCatError::from(ProtocolError::WrongType).into(),
             },
         }
-    }
-
-    fn execute_with_clock(&self, value: Option<EntrySnapshot<MyValue>>, _read_clock: u64) -> Value {
-        let mut reply = self.execute(value);
-        if let Value::Map(fields) = &mut reply {
-            fields.sort_unstable_by(|(left, _), (right, _)| match (left, right) {
-                (Value::BulkString(Some(left)), Value::BulkString(Some(right))) => left.cmp(right),
-                _ => unreachable!("hash fields are bulk strings"),
-            });
-        }
-        reply
     }
 }
 

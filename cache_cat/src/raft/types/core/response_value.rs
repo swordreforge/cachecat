@@ -73,6 +73,10 @@ pub enum Value {
         entries: Vec<(Value, Value)>,
         resp2: Resp2MapEncoding,
     },
+    /// String-only key/value pairs. Unlike `Map`, entries do not need a
+    /// `Value::BulkString` wrapper each; used by HGETALL and similar replies.
+    /// Appended last so existing serialized variant indices stay stable.
+    StringMap(Vec<(Bytes, Bytes)>),
 }
 
 /// Format a double the way Redis `d2string()` does:
@@ -235,6 +239,17 @@ impl Value {
                 for (k, v) in pairs {
                     k.encode_to(proto, buf);
                     v.encode_to(proto, buf);
+                }
+            }
+            Value::StringMap(pairs) => {
+                if proto == 3 {
+                    Self::put_line_usize(buf, b'%', pairs.len());
+                } else {
+                    Self::put_line_usize(buf, b'*', pairs.len() * 2);
+                }
+                for (field, value) in pairs {
+                    Self::put_bulk(buf, field);
+                    Self::put_bulk(buf, value);
                 }
             }
             Value::Set(items) => {
@@ -441,6 +456,27 @@ impl Value {
                         table.set(idx, k.into_lua_value(lua, resp)?)?;
                         idx += 1;
                         table.set(idx, v.into_lua_value(lua, resp)?)?;
+                    }
+                    Ok(mlua::Value::Table(table))
+                }
+            }
+            Value::StringMap(map) => {
+                if resp == 3 {
+                    let inner = lua.create_table()?;
+                    for (field, value) in map {
+                        inner.set(lua.create_string(&field)?, lua.create_string(&value)?)?;
+                    }
+                    let outer = lua.create_table()?;
+                    outer.set("map", inner)?;
+                    Ok(mlua::Value::Table(outer))
+                } else {
+                    let table = lua.create_table_with_capacity(map.len() * 2, 0)?;
+                    let mut idx = 0;
+                    for (field, value) in map {
+                        idx += 1;
+                        table.set(idx, lua.create_string(&field)?)?;
+                        idx += 1;
+                        table.set(idx, lua.create_string(&value)?)?;
                     }
                     Ok(mlua::Value::Table(table))
                 }
@@ -903,6 +939,26 @@ mod tests {
         )]);
         assert_eq!(enc(&v, 3), "%1\r\n$1\r\nk\r\n:1\r\n");
         assert_eq!(enc(&v, 2), "*2\r\n$1\r\nk\r\n:1\r\n");
+    }
+
+    #[test]
+    fn test_encode_string_map() {
+        let v = Value::StringMap(vec![
+            (Bytes::from_static(b"a"), Bytes::from_static(b"1")),
+            (Bytes::from_static(b"b"), Bytes::from_static(b"2")),
+        ]);
+        assert_eq!(
+            enc(&v, 3),
+            "%2\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n"
+        );
+        assert_eq!(
+            enc(&v, 2),
+            "*4\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n"
+        );
+
+        let empty = Value::StringMap(Vec::new());
+        assert_eq!(enc(&empty, 3), "%0\r\n");
+        assert_eq!(enc(&empty, 2), "*0\r\n");
     }
 
     #[test]
